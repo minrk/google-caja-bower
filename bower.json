@@ -2,7 +2,7 @@
   "description": "Google Caja HTML Sanitizer", 
   "homepage": "https://github.com/minrk/google-caja-bower", 
   "ignore": [
-    "git-svn-revision",
+    "git-svn-revision", 
     "tasks.py"
   ], 
   "keywords": [
@@ -10,5 +10,5 @@
   ], 
   "license": "Apache 2.0", 
   "name": "google-caja", 
-  "version": "5661.0.1"
+  "version": "5669.0.0"
 }
