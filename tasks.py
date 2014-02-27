@@ -52,20 +52,6 @@ def fetch(update=True):
             run("git pull")
 
 @task
-def version():
-    """write the svn revision to bower.json"""
-    fetch(False)
-    with cd(upstream):
-        result = run("../git-svn-revision")
-    revision = int(result.stdout)
-    vs = "%i.%i.%i" % (revision, build_version, build_version)
-    with open("bower.json") as f:
-        info = json.load(f)
-    info['version'] = vs
-    with open("bower.json", 'w') as f:
-        json.dump(info, f, sort_keys=True, indent=2)
-
-@task
 def minify():
     """generate minified js with uglify.js
     
@@ -86,3 +72,28 @@ def build():
     for f in glob.glob("{}/ant-lib/com/google/caja/plugin/*.js".format(upstream)):
         shutil.copy(f, basename(f))
     minify()
+
+@task
+def version():
+    """write the svn revision to bower.json"""
+    fetch(False)
+    with cd(upstream):
+        result = run("../git-svn-revision")
+    revision = int(result.stdout)
+    vs = "%i.%i.%i" % (revision, build_version, build_version)
+    with open("bower.json") as f:
+        info = json.load(f)
+    info['version'] = vs
+    with open("bower.json", 'w') as f:
+        json.dump(info, f, sort_keys=True, indent=2)
+    return vs
+
+@task
+def release():
+    """publish a release of the package"""
+    vs = version()
+    
+    run("git commit -a -m 'release %s'" % vs)
+    run("git tag '%s'" % vs)
+    run("git push")
+    run("git push --tags")
