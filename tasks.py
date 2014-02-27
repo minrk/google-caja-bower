@@ -13,7 +13,7 @@ from invoke import run, task
 
 caja_mirror = "https://github.com/minrk/google-caja-mirror"
 upstream = "upstream"
-dest = "google-caja"
+dest = "."
 build_version = 0
 patch_version = 0
 
@@ -26,6 +26,13 @@ def cd(path):
         yield
     finally:
         os.chdir(save)
+
+@task
+def clean():
+    """remove generated results"""
+    for js in glob.glob("*.js"):
+        print("removing %s" % js)
+        os.unlink(js)
 
 @task
 def ant():
@@ -59,10 +66,23 @@ def version():
         json.dump(info, f, sort_keys=True, indent=2)
 
 @task
+def minify():
+    """generate minified js with uglify.js
+    
+    There are problems with the minified output of ant.
+    """
+    for (src, minified) in [
+        ("caja.js", "caja-minified.js"),
+        ("html-sanitizer-bundle.js", "html-sanitizer-minified.js"),
+        ("html-css-sanitizer-bundle.js", "html-css-sanitizer-minified.js"),
+    ]:
+        run("uglifyjs %s > %s" % (src, minified))
+
+@task
 def build():
-    """build targets, and stage them into %s""" % dest
+    """build javascript targets, and stage them"""
+    clean()
     ant()
-    run("rm -rf {}".format(dest))
-    os.mkdir(dest)
     for f in glob.glob("{}/ant-lib/com/google/caja/plugin/*.js".format(upstream)):
-        shutil.copy(f, "{}/{}".format(dest, basename(f)))
+        shutil.copy(f, basename(f))
+    minify()
