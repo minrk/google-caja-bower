@@ -22,7 +22,7 @@
  * @overrides window
  */
 
-var cajaBuildVersion = '6003';
+var cajaBuildVersion = '6004';
 
 // Exports for closure compiler.
 if (typeof window !== 'undefined') {
