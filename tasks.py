@@ -3,19 +3,22 @@ from contextlib import contextmanager
 import glob
 import json
 import os
-from os.path import (exists, basename)
+from os.path import (exists, basename, join)
 import shutil
+from urllib.request import urlretrieve
 
 cd = os.chdir
 cp = shutil.copy2
 
 from invoke import run, task
 
-caja_mirror = "https://github.com/minrk/google-caja-mirror"
-upstream = "upstream"
+caja_mirror = "https://github.com/google/caja"
 dest = "."
 build_version = 0
 patch_version = 0
+
+upstream_parent = 'upstream'
+
 
 @contextmanager
 def cd(path):
@@ -32,24 +35,38 @@ def clean():
     """remove generated results"""
     for js in glob.glob("*.js"):
         print("removing %s" % js)
-        os.unlink(js)
+        os.remove(js)
 
 @task
-def ant():
+def ant(rev):
     """build caja with ant"""
-    fetch(False)
-    cp("git-svn-revision", "{}/tools/svnversion-nocolon".format(upstream))
+    upstream = fetch(rev)
+    with open("{}/tools/svnversion-nocolon".format(upstream), 'w') as f:
+        f.write("#!/bin/sh\necho '%s'\n" % rev)
     with cd(upstream):
         run("ant jars-no-src")
 
 @task
-def fetch(update=True):
-    """fetch the actual google-caja repo into %s""" % upstream
-    if not exists(upstream):
-        run("git clone {} {} --depth 1".format(caja_mirror, upstream))
-    elif update:
-        with cd(upstream):
-            run("git pull")
+def fetch(rev):
+    """fetch the actual google-caja repo from a tag"""
+    # https://github.com/google/caja/archive/v6005.tar.gz
+    if not exists(upstream_parent):
+        os.makedir(upstream_parent)
+    path = os.path.abspath(join(upstream_parent, 'caja-%s' % rev))
+    fname = path + '.tar.gz'
+    url = 'https://github.com/google/caja/archive/v%s.tar.gz' % rev
+    if not os.path.exists(fname):
+        print("Downloading %s -> %s" % (url, fname))
+        try:
+            urlretrieve(url, fname)
+        except Exception:
+            if os.path.exists(fname):
+                os.remove(fname)
+            raise
+    if not os.path.exists(path):
+        with cd(upstream_parent):
+            run("tar -xzf '{}'".format(fname))
+    return path
 
 @task
 def minify():
@@ -65,22 +82,20 @@ def minify():
         run("uglifyjs %s > %s" % (src, minified))
 
 @task
-def build():
+def build(rev):
     """build javascript targets, and stage them"""
     clean()
-    ant()
+    upstream = fetch(rev)
+    ant(rev)
     for f in glob.glob("{}/ant-lib/com/google/caja/plugin/*.js".format(upstream)):
         shutil.copy(f, basename(f))
     minify()
+    version(rev)
 
 @task
-def version():
+def version(rev):
     """write the svn revision to bower.json"""
-    fetch(False)
-    with cd(upstream):
-        result = run("../git-svn-revision")
-    revision = int(result.stdout)
-    vs = "%i.%i.%i" % (revision, build_version, build_version)
+    vs = "%s.%i.%i" % (rev, build_version, patch_version)
     with open("bower.json") as f:
         info = json.load(f)
     info['version'] = vs
@@ -89,11 +104,16 @@ def version():
     return vs
 
 @task
-def release():
+def release(rev):
     """publish a release of the package"""
-    vs = version()
+    build(rev)
+    vs = version(rev)
     
     run("git commit -a -m 'release %s'" % vs)
     run("git tag '%s'" % vs)
+    print("Run `invoke push` to publish this tag")
+
+@task
+def push():
     run("git push")
     run("git push --tags")
