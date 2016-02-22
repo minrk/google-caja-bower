@@ -22,7 +22,7 @@
  * @overrides window
  */
 
-var cajaBuildVersion = '5669';
+var cajaBuildVersion = '6001';
 
 // Exports for closure compiler.
 if (typeof window !== 'undefined') {
@@ -1084,7 +1084,7 @@ define.amd = true;;
   // of constructs (for example, the fact that `!x[1]` means `!(x[1])`
   // instead of `(!x)[1]` is handled by the fact that the parser
   // function that parses unary prefix operators is called first, and
-  // in turn calls the function that parses `[]` subscripts Ñ that
+  // in turn calls the function that parses `[]` subscripts â€” that
   // way, it'll receive the node for `x[1]` already parsed, and wraps
   // *that* in the unary operator node.
   //
@@ -1220,7 +1220,7 @@ define.amd = true;;
     raise(tokStart, "Unexpected token");
   }
 
-  // Verify that a node is an lval Ñ something that can be assigned
+  // Verify that a node is an lval â€” something that can be assigned
   // to.
 
   function checkLVal(expr) {
@@ -1693,7 +1693,7 @@ define.amd = true;;
     } else return base;
   }
 
-  // Parse an atomic expression Ñ either a single token that is an
+  // Parse an atomic expression â€” either a single token that is an
   // expression, an expression started by a keyword like `function` or
   // `new`, or an expression wrapped in punctuation like `()`, `[]`,
   // or `{}`.
@@ -1758,7 +1758,7 @@ define.amd = true;;
   }
 
   // New's precedence is slightly tricky. It must allow its argument
-  // to be a `[]` or dot subscript expression, but not a call Ñ at
+  // to be a `[]` or dot subscript expression, but not a call â€” at
   // least, not without wrapping it in parentheses. Thus, it uses the
 
   function parseNew() {
@@ -1795,8 +1795,8 @@ define.amd = true;;
         prop.value = parseFunction(startNode(), false);
       } else unexpected();
 
-      // getters and setters are not allowed to clash Ñ either with
-      // each other or with an init property Ñ and in strict mode,
+      // getters and setters are not allowed to clash â€” either with
+      // each other or with an init property â€” and in strict mode,
       // init properties are also not allowed to be repeated.
 
       if (prop.key.type === "Identifier" && (strict || sawGetSet)) {

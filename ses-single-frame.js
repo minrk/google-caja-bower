@@ -22,7 +22,7 @@
  * @overrides window
  */
 
-var cajaBuildVersion = '5669';
+var cajaBuildVersion = '6001';
 
 // Exports for closure compiler.
 if (typeof window !== 'undefined') {
@@ -425,10 +425,12 @@ var ses;
    *   <dt>REPAIRED</dt>
    *     <dd>test failed before and passed after repair attempt,
    *         repairing the problem (canRepair was true).</dd>
-   *   <dt>ACCIDENTALLY_REPAIRED</dt>
+   *   <dt>SYMPTOM_INTERMITTENT</dt>
    *      <dd>test failed before and passed after, despite no repair
-   *          to attempt. (Must have been fixed by some other
-   *          attempted repair.)</dd>
+   *          to attempt. Success was either intermittent or triggered
+   *          by some other attempted repair. Since we don't know why
+   *          it now seems to work, we must conservatively
+   *          assume that the underlying problem remains.</dd>
    *   <dt>BROKEN_BY_OTHER_ATTEMPTED_REPAIRS</dt>
    *      <dd>test passed before and failed after, indicating that
    *          some other attempted repair created the problem.</dd>
@@ -441,7 +443,7 @@ var ses;
     REPAIR_SKIPPED:                    'Repair skipped',
     REPAIRED_UNSAFELY:                 'Repaired unsafely',
     REPAIRED:                          'Repaired',
-    ACCIDENTALLY_REPAIRED:             'Accidentally repaired',
+    SYMPTOM_INTERMITTENT:              'Symptom intermittent',
     BROKEN_BY_OTHER_ATTEMPTED_REPAIRS: 'Broken by other attempted repairs'
   };
 
@@ -735,7 +737,8 @@ var ses;
               status = statuses.REPAIRED;
             }
           } else {
-            status = statuses.ACCIDENTALLY_REPAIRED;
+            postSeverity = problem.preSeverity;
+            status = statuses.SYMPTOM_INTERMITTENT;
           }
         }
       } else { // succeeded before
@@ -1026,7 +1029,7 @@ var ses;
    *
    * <p>[TODO(kpreid): Rewrite the rest of this comment to better
    * discuss repair-framework vs repairES5.]
-   * 
+   *
    * <p>Although <code>repairES5.js</code> can be used standalone for
    * partial ES5 repairs, its primary purpose is to repair as a first
    * stage of <code>initSES.js</code> for purposes of supporting SES
@@ -1126,7 +1129,10 @@ var ses;
  * //provides ses.ok, ses.okToLoad, ses.getMaxSeverity
  * //provides ses.is, ses.makeDelayedTamperProof
  * //provides ses.makeCallerHarmless, ses.makeArgumentsHarmless
+ * //provides ses.noFuncPoison
  * //provides ses.verifyStrictFunctionBody
+ * //provides ses.getUndeniables, ses.earlyUndeniables
+ * //provides ses.getAnonIntrinsics
  *
  * @author Mark S. Miller
  * @requires ___global_test_function___, ___global_valueOf_function___
@@ -1188,6 +1194,9 @@ var ses;
 
   var logger = ses.logger;
   var EarlyStringMap = ses._EarlyStringMap;
+
+  var severities = ses.severities;
+  var statuses = ses.statuses;
 
   /**
    * As we start to repair, this will track the worst post-repair
@@ -1254,8 +1263,6 @@ var ses;
    */
   function strictFnSpecimen() {}
 
-  var objToString = Object.prototype.toString;
-
   /**
    * Sample map early, to obtain a representative built-in for testing.
    *
@@ -1272,6 +1279,42 @@ var ses;
   var builtInMapMethod = Array.prototype.map;
 
   var builtInForEach = Array.prototype.forEach;
+
+  /**
+   * At https://bugs.ecmascript.org/show_bug.cgi?id=3113#c24 Jason
+   * Orendorff states the best draft for a simpler safe spec for the
+   * .caller and .argument properties on functions, that may or may
+   * not make it into ES6, but is on a track to standardization
+   * regardless. In Firefox 34 and
+   * https://bugzilla.mozilla.org/show_bug.cgi?id=969478 apparently
+   * this was implemented, or a reasonable approximation that we need
+   * to determine can be made SES-safe. Since this is a very different
+   * situation that the ES5 spec for these, we test which regime we
+   * seem to be in up front, so we can switch other logic based on this.
+   *
+   * If we seem to be in the new regime, then we try to delete the
+   * poison properties for simple safety, rather than trying to find
+   * subtle corner cases by which they might lose safety. If any of
+   * this fails, then we proceed under the assumption we're in the old
+   * regime.
+   *
+   * If noFuncPoison, then we're in the new regime made simply safe by
+   * these deletions, and we do not treat the names 'caller' and
+   * 'arguments' on functions as special.
+   */
+  var noFuncPoison =
+      Function.prototype.hasOwnProperty('caller') &&
+      Function.prototype.hasOwnProperty('arguments') &&
+      !strictFnSpecimen.hasOwnProperty('caller') &&
+      !strictFnSpecimen.hasOwnProperty('arguments') &&
+      !builtInMapMethod.hasOwnProperty('caller') &&
+      !builtInMapMethod.hasOwnProperty('arguments') &&
+      delete Function.prototype.caller &&
+      delete Function.prototype.arguments &&
+      !Function.prototype.hasOwnProperty('caller') &&
+      !Function.prototype.hasOwnProperty('arguments');
+  ses.noFuncPoison = noFuncPoison;
+
 
   /**
    * http://wiki.ecmascript.org/doku.php?id=harmony:egal
@@ -1336,6 +1379,14 @@ var ses;
   var simpleTamperProofOk = false;
 
   /**
+   * preemptThaw is only set to something other than a noop function
+   * when repairing THROWING_THAWS_FROZEN_OBJECT. It is made visible
+   * here because tamperProof needs to call it before it virtualizes
+   * data properties into accessor properties.
+   */
+  var preemptThaw = function(obj) {};
+
+  /**
    * "makeTamperProof()" returns a "tamperProof(obj, opt_pushNext)"
    * function that acts like "Object.freeze(obj)", except that, if obj
    * is a <i>prototypical</i> object (defined below), it ensures that
@@ -1391,7 +1442,6 @@ var ses;
     // but before any untrusted code runs in this frame.
     var gopd = Object.getOwnPropertyDescriptor;
     var gopn = Object.getOwnPropertyNames;
-    var getProtoOf = Object.getPrototypeOf;
     var freeze = Object.freeze;
     var isFrozen = Object.isFrozen;
     var defProp = Object.defineProperty;
@@ -1404,7 +1454,7 @@ var ses;
       if (typeof obj === 'function') {
         for (i = 0, j = 0; i < len; i++) {
           name = list[i];
-          if (name !== 'caller' && name !== 'arguments') {
+          if (noFuncPoison || (name !== 'caller' && name !== 'arguments')) {
             callback(name, j);
             j++;
           }
@@ -1439,6 +1489,7 @@ var ses;
           func.prototype === obj &&
           !isFrozen(obj)) {
         var pushNext = opt_pushNext || function(v) {};
+        preemptThaw(obj);
         forEachNonPoisonOwn(obj, function(name) {
           var value;
           function getter() {
@@ -1529,6 +1580,385 @@ var ses;
     makeDelayedTamperProofCalled = true;
     return tamperProof;
   };
+
+
+  ////////////////////// Brand testing /////////////////////
+
+  /**
+   * Note that, as of ES5, Object.prototype.toString.call(foo) (for
+   * the original Object.prototype.toString and original
+   * Function.prototype.call) was a reliable branding mechanism for
+   * distinguishing the built-in types. This is no longer true of ES6
+   * once untrusted code runs in that realm, and so should no longer
+   * be used for that purpose. See makeBrandTester and the brands it
+   * makes.
+   */
+  var objToString = Object.prototype.toString;
+
+  /**
+   * For reliably testing that a specimen is an exotic object of some
+   * built-in exotic type.
+   *
+   * <p>The exotic type should be those objects normally made by
+   * ctor. methodName must be the name of a method on ctor.prototype
+   * that, when applied to an exotic object of this exotic type as
+   * this-value, with the provided args list, will return without
+   * error, but when applied to any other object as this-value will
+   * throw an error. opt_example, if provided, must be an example of
+   * such an exotic object that can be used for internal sanity
+   * checking before returning a brandTester.
+   *
+   * <p>Uses Allen's trick from
+   * https://esdiscuss.org/topic/tostringtag-spoofing-for-null-and-undefined#content-59
+   * for brand testing that will remain reliable in ES6.
+   * However, testing reveals that, on FF 35.0.1, a proxy on an exotic
+   * object X will pass this brand test when X will. This is fixed as of
+   * FF Nightly 38.0a1.
+   *
+   * <p>Returns a brandTester function such that, if brandTester(specimen)
+   * returns true, this is a reliable indicator that specimen actually
+   * is an exotic object of that type.
+   *
+   * <p>As a convenience, ctor may be undefined, in which
+   * case we assume that there are no exotic objects of that kind. In
+   * this case, the returned brandTester always says false.
+   */
+  function makeBrandTester(ctor, methodName, args, opt_example) {
+    if (ctor === void 0) {
+      // If there is no built-in ctor, then we assume there cannot
+      // be any objects that are genuinely of that brand.
+      return function absentCtorBrandTester(specimen) { return false; };
+    }
+    var originalMethod = ctor.prototype[methodName];
+    function brandTester(specimen) {
+      if (specimen !== Object(specimen)) { return false; }
+      try {
+        originalMethod.apply(specimen, args);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+    // a bit of sanity checking before proceeding
+    var counterExamples = [null, void 0, true, 1, 'x', {}];
+    if (opt_example !== void 0) {
+      counterExamples.push({valueOf: function() { return opt_example; }});
+      counterExamples.push(Object.create(opt_example));
+    }
+    strictForEachFn(counterExamples, function(v, i) {
+      if (brandTester(v)) {
+        logger.error('Brand test ' + i + ' for ' + ctor + ' passed: ' + v);
+        ses._repairer.updateMaxSeverity(severities.NOT_SUPPORTED);
+      }
+    });
+    if (opt_example !== void 0 && typeof global.Proxy === 'function') {
+      // We treat the Proxy counter-example more gently for two reasons:
+      // * The test fails as of FF 35.0.1, which, as of this writing,
+      //   Caja must still support.
+      // * It currently does not cause an insecurity for us, since we
+      //   do not yet whitelist Proxy. We might use it internally (see
+      //   startSES.js) but we do not yet make it available to any
+      //   code running within SES.
+      // See https://bugzilla.mozilla.org/show_bug.cgi?id=1133249
+      // TODO(erights): Add a test for this to test262
+      // TODO(erights): Extract all these self-tests into tests
+      // performed within the repair framework.
+      // TODO(erights): Add a self-test that will catch any
+      // whitelisting of Proxy while this is still an issue.
+      var proxy = new global.Proxy(opt_example, {});
+      if (brandTester(proxy)) {
+        logger.warn('Brand test of proxy for ' + ctor + ' passed: ' + proxy);
+        ses._repairer.updateMaxSeverity(severities.SAFE_SPEC_VIOLATION);
+      }
+    }
+    if (opt_example !== void 0 && !brandTester(opt_example)) {
+      logger.error('Brand test for ' + ctor + ' failed: ' + opt_example);
+      ses._repairer.updateMaxSeverity(severities.NOT_SUPPORTED);
+    }
+    return brandTester;
+  }
+
+  /**
+   * A reliable brand test for whether specimen has a [[Class]] of
+   * "Date", or, in ES6 terminology, whether it has a [[DateValue]]
+   * internal slot.
+   */
+  var isBuiltinDate = makeBrandTester(
+      Date, 'getDay', [], new Date());
+
+  /**
+   * A reliable brand test for whether specimen has a [[Class]] of
+   * "Number", or, in ES6 terminology, whether it has a [[NumberData]]
+   * internal slot.
+   */
+  var isBuiltinNumberObject = makeBrandTester(
+      Number, 'toString', [], new Number(3));
+
+  /**
+   * A reliable brand test for whether specimen has a [[Class]] of
+   * "Boolean", or, in ES6 terminology, whether it has a [[BooleanData]]
+   * internal slot.
+   */
+  var isBuiltinBooleanObject = makeBrandTester(
+      Boolean, 'toString', [], new Boolean(true));
+
+  /**
+   * A reliable brand test for whether specimen has a [[Class]] of
+   * "String", or, in ES6 terminology, whether it has a [[StringData]]
+   * internal slot.
+   */
+  var isBuiltinStringObject = makeBrandTester(
+      String, 'toString', [], new String('y'));
+
+  /**
+   * A reliable brand test for whether specimen has a [[Class]] of
+   * "RegExp", or, in ES6 terminology, whether it has a [[RegExpMatcher]]
+   * internal slot.
+   */
+  var isBuiltinRegExp = makeBrandTester(
+      RegExp, 'exec', ['x'], /x/);
+
+  /**
+   * A reliable brand test for whether specimen has a [[WeakMapData]]
+   * internal slot.
+   */
+  var isBuiltinWeakMap = makeBrandTester(
+      global.WeakMap, 'get', [{}], global.WeakMap ? new WeakMap() : void 0);
+
+
+  //////////////// Undeniables and Intrinsics //////////////
+
+
+  /**
+   * A known strict function which returns its arguments object.
+   */
+  function strictArguments() { return arguments; }
+
+  /**
+   * A known sloppy function which returns its arguments object.
+   *
+   * Defined using Function so it'll be sloppy (not strict and not
+   * builtin).
+   */
+  var sloppyArguments = Function('return arguments;');
+
+  /**
+   * If present, a known strict generator function which yields its
+   * arguments object.
+   *
+   * <p>TODO: once all supported browsers implement ES6 generators, we
+   * can drop the "try"s below, drop the check for old Mozilla
+   * generator syntax, and treat strictArgumentsGenerator as
+   * unconditional in the test of the code.
+   */
+  var strictArgumentsGenerator = void 0;
+  try {
+    // ES6 syntax
+    strictArgumentsGenerator =
+        eval('(function*() { "use strict"; yield arguments; })');
+  } catch (ex) {
+    if (!(ex instanceof SyntaxError)) { throw ex; }
+    try {
+      // Old Firefox syntax
+      strictArgumentsGenerator =
+          eval('(function() { "use strict"; yield arguments; })');
+    } catch (ex2) {
+      if (!(ex2 instanceof SyntaxError)) { throw ex2; }
+    }
+  }
+
+  /**
+   * The undeniables are the primordial objects which are ambiently
+   * reachable via compositions of strict syntax, primitive wrapping
+   * (new Object(x)), and prototype navigation (the equivalent of
+   * Object.getPrototypeOf(x) or x.__proto__). Although we could in
+   * theory monkey patch primitive wrapping or prototype navigation,
+   * we won't. Hence, without parsing, the following are undeniable no
+   * matter what <i>other</i> monkey patching we do to the primordial
+   * environment.
+   */
+  function getUndeniables() {
+    var gopd = Object.getOwnPropertyDescriptor;
+    var getProto = Object.getPrototypeOf;
+
+    // The first element of each undeniableTuple is a string used to
+    // name the undeniable object for reporting purposes. It has no
+    // other programmatic use.
+    //
+    // The second element of each undeniableTuple should be the
+    // undeniable itself.
+    //
+    // The optional third element of the undeniableTuple, if present,
+    // should be an example of syntax, rather than use of a monkey
+    // patchable API, evaluating to a value from which the undeniable
+    // object in the second element can be reached by only the
+    // following steps:
+    // If the value is primitve, convert to an Object wrapper.
+    // Is the resulting object either the undeniable object, or does
+    // it inherit directly from the undeniable object?
+
+    var undeniableTuples = [
+        ['Object.prototype', Object.prototype, {}],
+        ['Function.prototype', Function.prototype, function(){}],
+        ['Array.prototype', Array.prototype, []],
+        ['RegExp.prototype', RegExp.prototype, /x/],
+        ['Boolean.prototype', Boolean.prototype, true],
+        ['Number.prototype', Number.prototype, 1],
+        ['String.prototype', String.prototype, 'x'],
+    ];
+    var result = {};
+
+    // Get the ES6 %Generator% intrinsic, if present.
+    // It is undeniable because individual generator functions inherit
+    // from it.
+    (function() {
+      // See http://people.mozilla.org/~jorendorff/figure-2.png
+      // i.e., Figure 2 of section 25.2 "Generator Functions" of the
+      // ES6 spec.
+      // https://people.mozilla.org/~jorendorff/es6-draft.html#sec-generatorfunction-objects
+      if (!strictArgumentsGenerator) { return; }
+      var Generator = getProto(strictArgumentsGenerator);
+      undeniableTuples.push(['%Generator%', Generator,
+                             strictArgumentsGenerator]);
+      strictArgumentsGenerator = strictArgumentsGenerator;
+    }());
+
+    strictForEachFn(undeniableTuples, function(tuple) {
+      var name = tuple[0];
+      var undeniable = tuple[1];
+      var start = tuple[2];
+      result[name] = undeniable;
+      if (start === void 0) { return; }
+      start = Object(start);
+      if (undeniable === start) { return; }
+      if (undeniable === getProto(start)) { return; }
+      throw new Error('Unexpected undeniable: ' + undeniable);
+    });
+
+    return result;
+  }
+  ses.getUndeniables = getUndeniables;
+
+  // For consistency checking, once we've done all our whitelist
+  // processing and monkey patching, we will call getUndeniables again
+  // and check that the undeniables are the same.
+  ses.earlyUndeniables = getUndeniables();
+
+
+  /**
+   * Get the intrinsics not otherwise reachable by named own property
+   * traversal. See
+   * https://people.mozilla.org/~jorendorff/es6-draft.html#sec-well-known-intrinsic-objects
+   * and the instrinsics section of whitelist.js
+   *
+   * <p>Unlike getUndeniables(), the result of getAnonIntrinsics()
+   * does depend on the current state of the primordials, so we must
+   * run this again after all other relevant monkey patching is done,
+   * in order to properly initialize cajaVM.intrinsics
+   */
+  function getAnonIntrinsics() {
+    var gopd = Object.getOwnPropertyDescriptor;
+    var getProto = Object.getPrototypeOf;
+    var result = {};
+
+    // If there are still other ThrowTypeError objects left after
+    // noFuncPoison-ing, this should be caught by
+    // test_THROWTYPEERROR_NOT_UNIQUE below, so we assume here that
+    // this is the only surviving ThrowTypeError intrinsic.
+    result.ThrowTypeError = gopd(arguments, 'caller').get;
+
+    // Get the ES6 %ArrayIteratorPrototype%, %StringIteratorPrototype%,
+    // and %IteratorPrototype% intrinsics, if present.
+
+    // TODO %MapIteratorPrototype%, %SetIteratorPrototype%
+    // It is currently safe to omit %MapIteratorPrototype% and
+    // %SetIteratorPrototype% since we do not yet whitelist Map and
+    // Set.
+    (function() {
+      var iteratorSym = global.Symbol && global.Symbol.iterator ||
+            "@@iterator"; // used instead of a symbol on FF35
+      if ([][iteratorSym]) {
+        var arrayIter = [][iteratorSym]();
+        var ArrayIteratorPrototype = getProto(arrayIter);
+        result.ArrayIteratorPrototype = ArrayIteratorPrototype;
+        var arrayIterProtoBase = getProto(ArrayIteratorPrototype);
+        if (arrayIterProtoBase !== Object.prototype) {
+          if (getProto(arrayIterProtoBase) !== Object.prototype) {
+            throw new Error(
+                '%IteratorPrototype%.__proto__ was not Object.prototype');
+          }
+          result.IteratorPrototype = arrayIterProtoBase;
+        }
+      }
+      if (''[iteratorSym]) {
+        var stringIter = ''[iteratorSym]();
+        var StringIteratorPrototype = getProto(stringIter);
+        result.StringIteratorPrototype = StringIteratorPrototype;
+        var stringIterProtoBase = getProto(StringIteratorPrototype);
+        if (stringIterProtoBase !== Object.prototype) {
+          if (!result.IteratorPrototype) {
+            if (getProto(stringIterProtoBase) !== Object.prototype) {
+              throw new Error(
+                  '%IteratorPrototype%.__proto__ was not Object.prototype');
+            }
+            result.IteratorPrototype = stringIterProtoBase;
+          } else {
+            if (result.IteratorPrototype !== stringIterProtoBase) {
+              throw new Error('unexpected %StringIteratorPrototype%.__proto__');
+            }
+          }
+        }
+      }
+    }());
+
+    // Get the ES6 %GeneratorFunction% intrinsic, if present.
+    (function() {
+      var Generator = ses.earlyUndeniables['%Generator%'];
+      if (!Generator || Generator === Function.prototype) { return; }
+      if (getProto(Generator) !== Function.prototype) {
+        throw new Error('Generator.__proto__ was not Function.prototype');
+      }
+      var GeneratorFunction = Generator.constructor;
+      if (GeneratorFunction === Function) { return; }
+      if (getProto(GeneratorFunction) !== Function) {
+        throw new Error('GeneratorFunction.__proto__ was not Function');
+      }
+      result.GeneratorFunction = GeneratorFunction;
+      var genProtoBase = getProto(Generator.prototype);
+      if (genProtoBase !== result.IteratorPrototype &&
+          genProtoBase !== Object.prototype) {
+        throw new Error('Unexpected Generator.prototype.__proto__');
+      }
+    }());
+
+    // Get the ES6 %TypedArray% intrinsic, if present.
+    (function() {
+      if (!global.Float32Array) { return; }
+      var TypedArray = getProto(global.Float32Array);
+      if (TypedArray === Function.prototype) { return; }
+      if (getProto(TypedArray) !== Function.prototype) {
+        // http://bespin.cz/~ondras/html/classv8_1_1ArrayBufferView.html
+        // has me worried that someone might make such an intermediate
+        // object visible.
+        throw new Error('TypedArray.__proto__ was not Function.prototype');
+      }
+      result.TypedArray = TypedArray;
+    }());
+
+    for (var name in result) {
+      if (result[name] === void 0) {
+        throw new Error('Malformed intrinsic: ' + name);
+      }
+    }
+
+    return result;
+  }
+  ses.getAnonIntrinsics = getAnonIntrinsics;
+
+  var unsafeIntrinsics = getAnonIntrinsics();
+
+
+  //////////////////////////////////////////////////////////
 
   /**
    * Fails if {@code funcBodySrc} does not parse as a strict
@@ -1708,9 +2138,194 @@ var ses;
   function testGlobalLeak(desc, that) {
     if (that === void 0) { return false; }
     if (that === global) { return true; }
+    // objToString use here ok, because it only determines the quality
+    // of diagnostic issued, and anyway runs only during SES
+    // initialization before objToString could be spoofed.
     if (objToString.call(that) === '[object Window]') { return true; }
     return desc + ' leaked as: ' + that;
   }
+
+
+  /**
+   * Maps from standinName to an array mapping from arity to a cached
+   * makeStandin function.
+   *
+   * Maps each blacklisted standinName to 'blacklisted'.
+   */
+  var standinMakerCache = EarlyStringMap();
+  (function(){
+     /**
+      * See <a href=
+      * "https://people.mozilla.org/~jorendorff/es6-draft.html"
+      * >ES6 Draft Spec</a>. The blacklist may conservatively contain
+      * names that would actually be safe. It may not omit names that
+      * would be unsafe.
+      */
+     var blacklist = [
+       // 11.6.2.1 Keywords
+       'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
+       'default', 'delete',
+       'do', 'else', 'export', 'extends', 'finally', 'for', 'function',
+       'if', 'import',
+       'in', 'instanceof', 'new', 'return', 'super', 'switch', 'this',
+       'throw', 'try',
+       'typeof', 'var', 'void', 'while', 'with', 'yield',
+
+       // 11.6.2.2 Future Reserved Words
+       'enum', 'await',
+       'implements', 'interface', 'package', 'private', 'protected',
+       'public', 'static',
+
+       // 11.8 Literals
+       'null', 'false', 'true',
+
+       // 12.1.1 Static Semantics: Early Errors
+       'arguments', 'eval',
+
+       // 14.5.1 Static Semantics: Early Errors
+       'let', 'constructor', 'prototype',
+
+       // names used in makeStandinSrc
+       'makeStandin', 'newF',
+
+       // The following are almost certainly safe, but blacklisting
+       // anyway just to be sure. Any of these might be unblacklisted in
+       // the futre.
+
+       // literal-like globals
+       'NaN', 'Infinity', 'undefined',
+
+       // $ is special in template strings
+       '$',
+
+       // contextually reserved or special in ES6
+       'module', 'of', 'as', 'from',
+
+       // expected to be contextually special in ES7
+       'async', 'on'
+
+       // 'get' and 'set' are contextually special in ES5, but despite
+       // that we assume they are safe.
+     ];
+
+     for (var i = 0, len = blacklist.length; i < len; i++) {
+       standinMakerCache.set(blacklist[i], 'blacklisted');
+     }
+   }());
+
+  /**
+   * Returns a makeStandin function which, given a function, returns a
+   * function which has the same call and construct behavior, but
+   * which has .length of arity, and, if known safe, a .name of
+   * standinName.
+   *
+   * The makeStandin function returned by makeStandinMaker is not
+   * generally fresh, to allow us to memoize these on standinName and
+   * arity.
+   */
+  function makeStandinMaker(standinName, arity) {
+    if (!/[a-zA-Z][a-zA-Z0-9]*/.test(standinName)) {
+      standinName = 'standin';
+    }
+    var cacheLine = standinMakerCache.get(standinName);
+    if (cacheLine === 'blacklisted') {
+      standinName = 'standin';
+      cacheLine = standinMakerCache.get(standinName);
+    }
+    if (!cacheLine) {
+      cacheLine = [];
+      standinMakerCache.set(standinName, cacheLine);
+    }
+    var result = cacheLine[arity];
+    if (!result) {
+      var args = [];
+      for (var i = 0; i < arity; i++) {
+        args.push('_' + i);
+      }
+      var makeStandinSrc = '(function makeStandin(newF) {\n' +
+        '  "use strict";\n' +
+        '  return function ' + standinName + '(' + args.join(',') + ') {\n' +
+        '    return newF.apply(this, arguments);\n' +
+        '  }\n' +
+        '})';
+      result = unsafeEval(makeStandinSrc);
+      cacheLine[arity] = result;
+    }
+    return result;
+  }
+
+  /**
+   * The function own property names that funcLike doesn't copy
+   * in a generic manner from newFunc to the returned standin.
+   */
+  var exemptFuncProps = noFuncPoison ? ['name', 'length'] :
+     ['name', 'length', 'caller', 'arguments'];
+
+  /**
+   * Given that newFunc represents a desired emulation of oldFunc
+   * except for its .name and .length properties, engage in best
+   * efforts to return a function like newFunc in which these
+   * remaining issues are repaired, possibly by modifying newFunc in
+   * place if possible, or possibly by wrapping it.
+   *
+   * If we instead create and return a new standin function which
+   * wraps newFunc, we also attempt to transfer any
+   * non-exemptFuncProps (see above) from newFunc to the returned
+   * standin.
+   *
+   * We assume that after this call, the caller will use whatever we
+   * return in lieu of accessing the newFunc they passed us directly,
+   * which is why we allow funcLike to either modify newFunc in place,
+   * or return a wrapper in which potentially mutable properties are
+   * copied. If this assumption is false, then a mutation to one of
+   * these properties on newFunc or the returned standin will not
+   * necessarily be reflected in the other.
+   *
+   * Note that ES5 does not specify a .name property on functions, and
+   * IE11 (as of this writing) does not implement one, so this
+   * implementation must be compatible with the absence of a .name
+   * property on functions.
+   */
+  function funcLike(newFunc, oldFunc) {
+    var name = ''+oldFunc.name;
+    var arity = +oldFunc.length;
+    // TODO(erights): On ES6 func.name starts configurable, so we
+    // should try to modify newFunc.name in place if we can.
+    // TODO(erights): On ES6 func.length starts configurable, so we
+    // should try to modify newFunc.length in place if we can.
+    if (''+newFunc.name === name && +newFunc.length === arity) {
+      return newFunc;
+    }
+
+    var makeStandin = makeStandinMaker(name, arity);
+    var standin = makeStandin(newFunc);
+
+    var pnames = Object.getOwnPropertyNames(newFunc);
+    pnames.forEach(function(pname) {
+      if (exemptFuncProps.indexOf(pname) === -1) {
+        Object.defineProperty(standin, pname,
+                              Object.getOwnPropertyDescriptor(newFunc, pname));
+      }
+    });
+
+    // The isFrozen and isSealed branches of the tests below seem
+    // redundant with !isExtensible, since frozenness and sealedness
+    // is, as of ES5, only the combination of extensibility + property
+    // attributes. We do this anyway for two reasons: Because the
+    // defineProperty loop above skips the exemptFuncProps. And in
+    // case a future ES spec has frozenness or sealedness mean
+    // something beyond merely extensibility + property attributes.
+    if (Object.isFrozen(newFunc)) {
+      Object.freeze(standin);
+    } else if (Object.isSealed(newFunc)) {
+      Object.seal(standin);
+    } else if (!Object.isExtensible(newFunc)) {
+      Object.preventExtensions(standin);
+    }
+    return standin;
+  }
+  ses.funcLike = funcLike;
+
 
   ////////////////////// Tests /////////////////////
   //
@@ -1776,9 +2391,32 @@ var ses;
     return false;
   }
 
+  /**
+   * Create a new iframe and pass its 'window' object to the provided
+   * callback.  If the environment is not a browser, return undefined
+   * and do not call the callback.
+   *
+   * <p>inTestFrame assumes we are in a browser environment iff there
+   * is a non-undefined document with a truthy createElement
+   * property. If so, it creates an iframe, makes it a child somewhere
+   * of the current document, calls the callback, passing that
+   * iframe's window, and then removes the iframe.
+   *
+   * <p>A typical callback (e.g., _optForeignForIn) will then create a
+   * function within that other frame, to be used later to test
+   * cross-frame operations. However, on IE10 on Windows, this iframe
+   * removal may then prevent that created function from running at
+   * that later time, with a "Error: Can't execute code from a freed
+   * script" error.
+   */
   function inTestFrame(callback) {
-    if (!document || !document.createElement) { return undefined; }
+    if (!(typeof document !== 'undefined' && document.createElement)) {
+      return undefined;
+    }
     var iframe = document.createElement('iframe');
+    // Four choices for where to put the iframe seems like a lot. How
+    // many of these have been, or even can be, tested? Can we kill
+    // the ones we cannot test?
     var container = document.body || document.getElementsByTagName('head')[0] ||
         document.documentElement || document;
     container.appendChild(iframe);
@@ -2202,9 +2840,8 @@ var ses;
       return 'Curries construction failed with: ' + err;
     }
     if (typeof d === 'string') { return true; } // Opera
-    var str = objToString.call(d);
-    if (str === '[object Date]') { return false; }
-    return 'Unexpected ' + str + ': ' + d;
+    if (isBuiltinDate(d)) { return false; }
+    return 'Unexpected alleged Date: ' + d;
   }
 
   /**
@@ -2267,6 +2904,50 @@ var ses;
   }
 
   /**
+   * As of ES6, for all the builtin constructors (except Function)
+   * that make a particular type of exotic object, that
+   * constructor.prototype must be a plain object rather than that
+   * kind of exotic object. As of this writing, at least Chrome, FF,
+   * Safari, Opera, and IE11 violate this.
+   */
+  function test_NUMBER_PROTO_IS_NUMBER() {
+    return isBuiltinNumberObject(Number.prototype);
+  }
+
+  /**
+   * As of ES6, for all the builtin constructors (except Function)
+   * that make a particular type of exotic object, that
+   * constructor.prototype must be a plain object rather than that
+   * kind of exotic object. As of this writing, at least Chrome, FF,
+   * Safari, Opera, and IE11 violate this.
+   */
+  function test_BOOLEAN_PROTO_IS_BOOLEAN() {
+    return isBuiltinBooleanObject(Boolean.prototype);
+  }
+
+  /**
+   * As of ES6, for all the builtin constructors (except Function)
+   * that make a particular type of exotic object, that
+   * constructor.prototype must be a plain object rather than that
+   * kind of exotic object. As of this writing, at least Chrome, FF,
+   * Safari, Opera, and IE11 violate this.
+   */
+  function test_STRING_PROTO_IS_STRING() {
+    return isBuiltinStringObject(String.prototype);
+  }
+
+  /**
+   * As of ES6, for all the builtin constructors (except Function)
+   * that make a particular type of exotic object, that
+   * constructor.prototype must be a plain object rather than that
+   * kind of exotic object. As of this writing, at least Chrome, FF,
+   * Safari, Opera, and IE11 violate this.
+   */
+  function test_REGEXP_PROTO_IS_REGEXP() {
+    return isBuiltinRegExp(RegExp.prototype);
+  }
+
+  /**
    * Detects https://code.google.com/p/v8/issues/detail?id=1447
    *
    * <p>This bug is fixed as of V8 r8258 bleeding-edge, but is not yet
@@ -2324,19 +3005,9 @@ var ses;
    * <p>Sometimes, when trying to freeze an object containing an
    * accessor property with a getter but no setter, Chrome <= 17 fails
    * with <blockquote>Uncaught TypeError: Cannot set property ident___
-   * of #<Object> which has only a getter</blockquote>. So if
-   * necessary, the repair overrides {@code Object.defineProperty} to
-   * always install a dummy setter in lieu of the absent one.
-   *
-   * <p>Since this problem seems to have gone away as of Chrome 18, it
-   * is no longer as important to isolate and report it.
-   *
-   * <p>TODO(erights): We should also override {@code
-   * Object.getOwnPropertyDescriptor} to hide the presence of the
-   * dummy setter, and instead report an absent setter.
+   * of #<Object> which has only a getter</blockquote>.
    */
   function test_NEEDS_DUMMY_SETTER() {
-    if (NEEDS_DUMMY_SETTER_repaired) { return false; }
     if (typeof navigator === 'undefined') { return false; }
     var ChromeMajorVersionPattern = (/Chrome\/(\d*)\./);
     var match = ChromeMajorVersionPattern.exec(navigator.userAgent);
@@ -2344,9 +3015,6 @@ var ses;
     var ver = +match[1];
     return ver <= 17;
   }
-  /** we use this variable only because we haven't yet isolated a test
-   * for the problem. */
-  var NEEDS_DUMMY_SETTER_repaired = false;
 
   /**
    * Detects https://code.google.com/p/chromium/issues/detail?id=94666
@@ -2495,6 +3163,7 @@ var ses;
       // Seen in IE9. Harmless by itself
       return false;
     }
+    if (desc === void 0 && noFuncPoison) { return false; }
     return 'getOwnPropertyDesciptor returned unexpected caller descriptor';
   }
 
@@ -2516,6 +3185,7 @@ var ses;
       return 'hasOwnProperty failed with: ' + err;
     }
     if (answer) { return false; }
+    if (noFuncPoison) { return false; }
     return 'strict_function.hasOwnProperty("caller") was false';
   }
 
@@ -2610,6 +3280,7 @@ var ses;
       return '("caller" in strict_func) failed with: ' + err;
     } finally {}
     if (answer) { return false; }
+    if (noFuncPoison) { return false; }
     return '("caller" in strict_func) was false.';
   }
 
@@ -2631,6 +3302,7 @@ var ses;
       return '("arguments" in strict_func) failed with: ' + err;
     } finally {}
     if (answer) { return false; }
+    if (noFuncPoison) { return false; }
     return '("arguments" in strict_func) was false.';
   }
 
@@ -2655,6 +3327,7 @@ var ses;
       // Seen on IE 9
       return true;
     }
+    if (caller === void 0 && noFuncPoison) { return false; }
     return 'Unexpected "caller": ' + caller;
   }
 
@@ -2679,6 +3352,7 @@ var ses;
       // Seen on IE 9
       return true;
     }
+    if (args === void 0 && noFuncPoison) { return false; }
     return 'Unexpected arguments: ' + arguments;
   }
 
@@ -3547,27 +4221,76 @@ var ses;
       desc.enumerable + ', value: ' + desc.value;
   }
 
-  function getThrowTypeError() {
-    return Object.getOwnPropertyDescriptor(getThrowTypeError, 'arguments').get;
+  /**
+   * %ThrowTypeError% is not unique (even after whatever cleanup was
+   * already done during the noFuncPoison testing above).
+   */
+  function test_THROWTYPEERROR_NOT_UNIQUE() {
+    var tte = unsafeIntrinsics.ThrowTypeError;
+    if (typeof tte !== 'function') {
+      return 'Unexpected %ThrowTypeError%: ' + tte;
+    }
+    var others = [];
+    var sourcesOfTTE = [
+      [Function.prototype, 'Function.prototype', ['caller', 'arguments']],
+      [builtInMapMethod, 'builtin function', ['caller', 'arguments']],
+      [strictArguments, 'strict function', ['caller', 'arguments']],
+      [sloppyArguments, 'sloppy function', ['caller', 'arguments']],
+      [strictArguments(), 'strict arguments', ['caller', 'callee']],
+      [sloppyArguments(), 'sloppy arguments', ['caller', 'callee']]
+    ];
+    if (strictArgumentsGenerator) {
+      var strictGeneratedArgs = strictArgumentsGenerator().next().value;
+      sourcesOfTTE.push(
+        [strictArgumentsGenerator, 'strict generator', ['caller', 'arguments']],
+        [strictGeneratedArgs, 'strict generated arguments',
+         ['caller', 'callee']]);
+    }
+    var Generator = ses.earlyUndeniables['%Generator%'];
+    if (Generator) {
+      sourcesOfTTE.push([Generator, '%Generator%', ['caller', 'arguments']]);
+    }
+    var GeneratorFunction = unsafeIntrinsics.GeneratorFunction;
+    if (GeneratorFunction) {
+      sourcesOfTTE.push([GeneratorFunction, '%GeneratorFunction%',
+                    ['caller', 'arguments']]);
+    }
+
+    strictForEachFn(sourcesOfTTE, function(sourceOfTTE) {
+      var base = sourceOfTTE[0];
+      var where = sourceOfTTE[1];
+      var names = sourceOfTTE[2];
+      strictForEachFn(names, function(name) {
+        var desc = Object.getOwnPropertyDescriptor(base, name);
+        if (!desc) { return; }
+        strictForEachFn(['get', 'set'], function (attr) {
+          var otherTTE = desc[attr];
+          if (!otherTTE || otherTTE === tte) { return; }
+          others.push(where + ' ' + attr + ' ' + name);
+        });
+      });
+    });
+    if (others.length === 0) { return false; }
+    return 'Multiple %ThrowTypeError%s: ' + others.join(', ');
   }
 
   /**
-   * [[ThrowTypeError]] is extensible or has modifiable properties.
+   * %ThrowTypeError% is extensible or has modifiable properties.
    */
   function test_THROWTYPEERROR_UNFROZEN() {
-    return !Object.isFrozen(getThrowTypeError());
+    return !Object.isFrozen(unsafeIntrinsics.ThrowTypeError);
   }
 
   /**
-   * [[ThrowTypeError]] has properties which the spec gives to other function
-   * objects but not [[ThrowTypeError]].
+   * %ThrowTypeError% has properties which the spec gives to other function
+   * objects but not %ThrowTypeError%.
    *
    * We don't check for arbitrary properties because they might be extensions
    * for all function objects, which we don't particularly want to complain
    * about (and will delete via whitelisting).
    */
   function test_THROWTYPEERROR_PROPERTIES() {
-    var tte = getThrowTypeError();
+    var tte = unsafeIntrinsics.ThrowTypeError;
     return !!Object.getOwnPropertyDescriptor(tte, 'prototype') ||
         !!Object.getOwnPropertyDescriptor(tte, 'arguments') ||
         !!Object.getOwnPropertyDescriptor(tte, 'caller');
@@ -3661,8 +4384,8 @@ var ses;
   ];
 
   function test_TYPED_ARRAYS_THROW_DOMEXCEPTION() {
-    if (global.DataView === 'undefined') { return false; }
-    if (global.DOMException === 'undefined') { return false; }
+    if (global.DataView === undefined) { return false; }
+    if (global.DOMException === undefined) { return false; }
     function subtest(f) {
       try {
         f();
@@ -3772,6 +4495,349 @@ var ses;
     }
   }
 
+  /**
+   * Bug in IE versions 9 to 11 (current as of this writing):
+   * http://webreflection.blogspot.co.uk/2014/04/all-ie-objects-are-broken.html
+   *
+   * An object which is a product of Object.create(somePrototype), and which has
+   * only numeric-named properties, will in some ways appear to not have those
+   * properties.
+   */
+  function test_NUMERIC_PROPERTIES_INVISIBLE() {
+    var o1 = Object.create({}, {0: {value: 1}});  // normal
+    var o2 = Object.create({});                   // demonstrates bug
+    o2[0] = 1;
+
+    if (o1.hasOwnProperty('0') && o1[0] === 1 &&
+        o2.hasOwnProperty('0') && o2[0] === 1) {
+      return false;
+    } else if (o1.hasOwnProperty('0') && o1[0] === 1 &&
+               !o2.hasOwnProperty('0') && o2[0] === 1) {
+      return true;
+    } else {
+      return 'Unexpected results from numeric property on created object';
+    }
+  }
+
+  /**
+   * Tests for https://code.google.com/p/v8/issues/detail?id=3334
+   * which reports that setting a function's prototype with
+   * defineProperty can update its descriptor without updating the
+   * actual value when also changing writable from true to false.
+   */
+  function test_DEFINE_PROPERTY_CONFUSES_FUNC_PROTO() {
+    function bar() {}
+    var oldBarPrototype = bar.prototype;
+    Object.defineProperty(bar, 'prototype', {value: 2, writable: false});
+    var desc = Object.getOwnPropertyDescriptor(bar, 'prototype');
+    if (desc.value !== 2) {
+        return 'Unexpected descriptor from setting a function\'s ' +
+          'protptype with defineProperty: ' + JSON.stringify(desc);
+    }
+    if (bar.prototype === 2) {
+      return false;
+    } else if (typeof bar.prototype === 'object') {
+      if (bar.prototype === oldBarPrototype) {
+        return true;
+      } else {
+        return 'Unexpected prototype identity from setting a function\'s ' +
+          'prototype with defineProperty.';
+      }
+    } else {
+      return 'Unexpected result of setting a function\'s prototype ' +
+        'with defineProperty: ' + typeof bar.prototype;
+    }
+  }
+
+  /**
+   * In ES6, the constructor property of the %Generator% intrinsic
+   * initially points at the unsafe %GeneratorFunction% intrinsic. This
+   * property is supposed to have attributes
+   * { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: true }
+   * Prior to 2/19/2015, on v8 it had attributes
+   * { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
+   * making it impossible to change the property's value.
+   *
+   * <p>Since the original %GeneratorFunction% intrinsic, like the
+   * global Function constructor, accepts a function body which it
+   * executes in the global scope, it would be reachable by any
+   * generator. Without parsing, we would not be able to prevent
+   * the following expression
+   * <pre>
+   * (function*(){}).constructor('yield window;')().next().value
+   * </pre>
+   * from providing the genuine global window object of that realm.
+   */
+  function test_GENERATORFUNCTION_CANNOT_BE_DENIED() {
+    var gopd = Object.getOwnPropertyDescriptor;
+    var getProto = Object.getPrototypeOf;
+
+    var UnsafeGeneratorFunction = unsafeIntrinsics.GeneratorFunction;
+    if (!UnsafeGeneratorFunction) { return false; }
+    var Generator = ses.earlyUndeniables['%Generator%'];
+    if (!(Generator &&
+          Generator.constructor === UnsafeGeneratorFunction &&
+          UnsafeGeneratorFunction.prototype === Generator &&
+          getProto(UnsafeGeneratorFunction) === UnsafeFunction &&
+          getProto(Generator) === Function.prototype)) {
+      return 'Unexpected primordial Generator arrangement';
+    }
+    var desc = gopd(Generator, 'constructor');
+    return desc.writable === false && desc.configurable === false;
+  }
+
+  /**
+   * ES6 introduces a new "import" special form syntax, which imports
+   * access to modules that we cannot currently control. Therefore, if
+   * we cannot prevent use of the "import" syntax, we lose
+   * isolation. Fortunately, the "import" syntax can only legally
+   * occur with modules, not within the text that the original eval,
+   * Function, or %GeneratorFunction% would accept. Since untrusted
+   * code enters a SES environment only through these, we should be
+   * safe.
+   *
+   * <p>This test checks that this assumption indeed holds for the
+   * current platform.
+   */
+  function test_IMPORT_CAN_BE_EVALLED() {
+    // From Table 40 at
+    // https://people.mozilla.org/~jorendorff/es6-draft.html#sec-source-text-module-records
+    // The following test will actually attempt to eval the following
+    // strings, so it is important that there not be strings here that
+    // can do damage if this eval succeeds during SES
+    // initialization. This is before any untrusted code runs in this
+    // realm, so we assume that no module named __noModWithThisName__
+    // is yet importable.
+    var importExamples = [
+        'import v from "__noModWithThisName__";',
+        'import * as ns from "__noModWithThisName__";',
+        'import {x} from "__noModWithThisName__";',
+        'import {x as v} from "__noModWithThisName__";',
+        'import "__noModWithThisName__";'];
+    var evallers = [unsafeEval, UnsafeFunction];
+    if (unsafeIntrinsics.GeneratorFunction) {
+      evallers.push(unsafeIntrinsics.GeneratorFunction);
+    }
+    for (var i = 0; i < importExamples.length; i++) {
+      for (var j = 0; j < evallers.length; j++) {
+        try {
+          evallers[j](importExamples[i]);
+          return true;
+        } catch (ex) {
+          if (!(ex instanceof SyntaxError)) {
+            return 'unexpected "' + importExamples[i] + '" failure: ' + ex;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Detects https://bugs.webkit.org/show_bug.cgi?id=141865
+   *
+   * <p>On Safari 7.0.5 (9537.77.4), the getter of the
+   * Object.prototype.__proto__ property, if applied to undefined,
+   * acts like a sloppy function would, coercing the undefined to the
+   * global object and returning the global object's [[Prototype]].
+   */
+  function test_UNDERBAR_PROTO_GETTER_USES_GLOBAL() {
+    var gopd = Object.getOwnPropertyDescriptor;
+    var getProto = Object.getPrototypeOf;
+
+    var desc = gopd(Object.prototype, '__proto__');
+    if (!desc) { return false; }
+    var getter = desc.get;
+    if (!getter) { return false; }
+    var globalProto = void 0;
+    try {
+      globalProto = getter();
+    } catch (ex) {
+      if (ex instanceof TypeError && globalProto === void 0) {
+          return false;
+      }
+      return 'unexpected error: ' + ex;
+    }
+    if (getProto(global) === globalProto) { return true; }
+    return 'unexpected global.__proto__: ' + globalProto;
+  }
+
+  /**
+   * Detects https://bugs.webkit.org/show_bug.cgi?id=141865
+   *
+   * <p>On Safari 7.0.5 (9537.77.4), the setter of the
+   * Object.prototype.__proto__ property, if applied to undefined,
+   * acts like a sloppy function would, coercing the undefined to the
+   * global object and setting its [[Prototype]].
+   */
+  function test_UNDERBAR_PROTO_SETTER_USES_GLOBAL() {
+    var gopd = Object.getOwnPropertyDescriptor;
+    var getProto = Object.getPrototypeOf;
+
+    var desc = gopd(Object.prototype, '__proto__');
+    if (!desc) { return false; }
+    var setter = desc.set;
+    if (!setter) { return false; }
+    var globalProto = getProto(global);
+    // Just insert an intermediate object into the prototype chain of the
+    // global object, so this realm is left in a usable state.
+    var splicedProto = Object.create(globalProto);
+    try {
+      setter(splicedProto);
+    } catch (ex) {
+      if (ex instanceof TypeError && getProto(global) === globalProto) {
+        return false;
+      }
+      return 'unexpected error: ' + ex;
+    }
+    if (getProto(global) === splicedProto) { return true; }
+    return 'unexpected global.__proto__: ' + getProto(global);
+  }
+
+  /**
+   * Detects https://bugs.webkit.org/show_bug.cgi?id=141878
+   *
+   * <p>On Safari 7.0.5 (9537.77.4), throwing a frozen object results
+   * in it becoming unfrozen and  several properties being added to
+   * it: 'line', 'column', 'sourceURL' (not always), and 'stack'. The
+   * big security hole is due to 'stack', which is added as a
+   * writable configurable property. Although initialized to a string,
+   * one can assign an arbitrary object to it, opening a capability
+   * leak.
+   */
+  function test_THROWING_THAWS_FROZEN_OBJECT() {
+    var o = Object.freeze([1, 2]);
+    if (!Object.isFrozen(o)) {
+      return 'Unexpected spontaneous thaw';
+    }
+    var oldNames = Object.getOwnPropertyNames(o);
+    try {
+      throw o;
+    } catch (e) {
+      if (e !== o) {
+        return 'What was thrown is not what was caught';
+      }
+      if (Object.isFrozen(e)) {
+        // In the bug we're testing for, Object.isFrozen(e) is false,
+        // which is dealt with below this if-statement.
+        // If Object.isFrozen(e) is true, presumably this platform
+        // does not have the bug. Before concluding that we're safe
+        // from this bug (returning false) the rest of this case does
+        // a bit of sanity checking to make sure that other symptoms
+        // of this bug are absent.
+        var newNames = Object.getOwnPropertyNames(o);
+        if (oldNames.length !== newNames.length) {
+          return 'Throwing changed properties to: ' + newNames;
+        }
+        return false;
+      }
+      var oldStack = e.stack;
+      var capLeak = {};
+      try {
+        e.stack = capLeak;
+      } catch (err) {
+        if (e.stack === oldStack) {
+          throw 'Unexpected failure to leak: ' + err;
+        }
+      }
+      if (e.stack === capLeak) { return true; }
+    }
+    return 'Unexpected result of throwing frozen object';
+  }
+
+
+  /**
+   * Tests for https://bugzilla.mozilla.org/show_bug.cgi?id=1125389
+   * which is a Firefox specific bug that enables one to extend
+   * objects that were supposedly made non-extensible.
+   */
+  function test_NON_EXTENSIBLES_EXTENSIBLE() {
+    var someVar = 33;
+    var a = void 0;
+    function Obj() {
+      this.x = 0;
+      Object.preventExtensions(this);
+    }
+    var i = 0;
+    function test() {
+      var A = new Obj();
+      a = A;
+      while (i < 2000) {
+        i++;
+        if (Object.isExtensible(A)) {
+          return;
+        }
+      }
+      A.length1 = someVar;
+    }
+    try {
+      test();
+    } catch (e) {
+      if (e instanceof TypeError && i === 2000) {
+        return false;
+      } else {
+        return 'Unexpected error: ' + e;
+      }
+    }
+    try {
+      a.randomProperty = someVar;
+      a.length1 = someVar;
+    } catch (e2) {
+      return 'Extending failed: ' + e2;
+    }
+    if (a.randomProperty !== someVar || a.length1 !== someVar) {
+      return 'Did not extend correctly: ' + a;
+    }
+    return true;
+  }
+
+
+  /**
+   * _optForeignForIn, if non-undefined, is a function of one parameter
+   * in a foreign frame that does a do-nothing for/in on that
+   * parameter. Used for detecting
+   * https://code.google.com/p/google-caja/issues/detail?id=1962 ,
+   * i.e., whether cross-frame for/in relies on the
+   * non-standard %IteratorPrototype%.next method being present.
+   *
+   * <p>Exported so that startSES can test whether whitelisting
+   * %IteratorPrototype%.next "fixes" the problem.
+   *
+   * <p>When run in a non-browser environment, _optForeignForIn is
+   * undefined.
+   */
+  ses._optForeignForIn = inTestFrame(function(window) {
+    return window.Function('o', '"use strict"; for (var x in o) {}');
+  });
+
+  function test_CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT() {
+    var getProto = Object.getPrototypeOf;
+
+    if (!ses._optForeignForIn) { return false; }
+    var nextless = inTestFrame(function(window) {
+      var iterSym = window.Symbol && window.Symbol.iterator;
+      if (!iterSym) { return void 0; }
+      var arrayIter = (new window.Array())[iterSym]();
+      var iterProto = getProto(getProto(arrayIter));
+      if (!(iterProto.hasOwnProperty('next'))) { return void 0; }
+      delete iterProto.next;
+      return window.eval('"use strict"; ({});');
+    });
+    if (!nextless) { return false; }
+    try {
+      ses._optForeignForIn(nextless);
+    } catch (err) {
+      // Cannot easily instanceof Error, since it is a cross-frame
+      // error. No reliable brand test for Error anyway.
+      if (err.name === 'TypeError' && 'message' in err) {
+        return true;
+      }
+      return 'Unexpected error: ' + err;
+    }
+    return false;
+  }
+
+
   ////////////////////// Repairs /////////////////////
   //
   // Each repair_NAME function exists primarily to repair the problem
@@ -3790,8 +4856,9 @@ var ses;
   var isExtensible = Object.isExtensible;
 
   /*
-   * Fixes both FUNCTION_PROTOTYPE_DESCRIPTOR_LIES and
-   * DEFINING_READ_ONLY_PROTO_FAILS_SILENTLY.
+   * Fixes FUNCTION_PROTOTYPE_DESCRIPTOR_LIES,
+   * DEFINING_READ_ONLY_PROTO_FAILS_SILENTLY and
+   * DEFINE_PROPERTY_CONFUSES_FUNC_PROTO.
    */
   function repair_DEFINE_PROPERTY() {
     function repairedDefineProperty(base, name, desc) {
@@ -3802,6 +4869,7 @@ var ses;
           base.prototype = desc.value;
         } catch (err) {
           logger.warn('prototype fixup failed', err);
+          throw err;
         }
       } else if (name === '__proto__' && !isExtensible(base)) {
         throw TypeError('Cannot redefine __proto__ on a non-extensible object');
@@ -3840,29 +4908,29 @@ var ses;
   /**
    * Return a function suitable for using as a forEach argument on a
    * list of method names, where that function will monkey patch each
-   * of these names methods on {@code constr.prototype} so that they
-   * can't be called on a {@code constr.prototype} itself even across
+   * of these names methods on {@code ctor.prototype} so that they
+   * can't be called on a {@code ctor.prototype} itself even across
    * frames.
    *
-   * <p>This only works when {@code constr} corresponds to an internal
-   * [[Class]] property whose value is {@code classString}. To test
-   * for {@code constr.prototype} cross-frame, we observe that for all
-   * objects of this [[Class]], only the prototypes directly inherit
-   * from an object that does not have this [[Class]].
+   * <p>This only works when {@code ctor} is the constructor of
+   * objects that are supposed to pass hasBrand, and
+   * ctor.prototype inappropriately also passes the hasBrand. To
+   * test for {@code ctor.prototype} cross-frame, we observe that
+   * for all objects that do pass the hasBrand, only the
+   * ctor.prototype objects directly inherit from an object that
+   * does not pass this hasBrand.
    */
-  function makeMutableProtoPatcher(constr, classString) {
-    var proto = constr.prototype;
-    var baseToString = objToString.call(proto);
-    if (baseToString !== '[object ' + classString + ']') {
-      throw new TypeError('unexpected: ' + baseToString);
+  function makeMutableProtoPatcher(ctor, hasBrand) {
+    var proto = ctor.prototype;
+    if (!hasBrand(proto)) {
+      throw new TypeError('unexpected: ' + proto);
     }
     var grandProto = getPrototypeOf(proto);
-    var grandBaseToString = objToString.call(grandProto);
-    if (grandBaseToString === '[object ' + classString + ']') {
-      throw new TypeError('malformed inheritance: ' + classString);
+    if (hasBrand(grandProto)) {
+      throw new TypeError('malformed inheritance: ' + ctor);
     }
     if (grandProto !== Object.prototype) {
-      logger.log('unexpected inheritance: ' + classString);
+      logger.log('unexpected inheritance: ' + ctor);
     }
     function mutableProtoPatcher(name) {
       if (!hop.call(proto, name)) { return; }
@@ -3877,22 +4945,23 @@ var ses;
           // succeed, since, for example, a non-Date can still inherit
           // from Date.prototype. However, in such cases, the built-in
           // method application will fail on its own without our help.
-          if (objToString.call(parent) !== baseToString) {
-            // As above, === baseToString does not necessarily mean
-            // success, but the built-in failure again would not need
-            // our help.
-            var thisToString = objToString.call(this);
-            if (thisToString === baseToString) {
+          if (!hasBrand(parent)) {
+            // As above, hasBrand(parent) being true does not
+            // necessarily mean success, but the built-in failure
+            // again would not need our help.
+            if (hasBrand(this)) {
               throw new TypeError('May not mutate internal state of a ' +
-                                  classString + '.prototype');
+                                  ctor + '.prototype');
             } else {
-              throw new TypeError('Unexpected: ' + thisToString);
+              throw new TypeError('Unexpected: ' + this);
             }
           }
         }
         return originalMethod.apply(this, arguments);
       }
-      Object.defineProperty(proto, name, { value: replacement });
+      replacement.prototype = null;
+      var w = funcLike(replacement, originalMethod);
+      Object.defineProperty(proto, name, { value: w });
     }
     return mutableProtoPatcher;
   }
@@ -3915,13 +4984,14 @@ var ses;
      'setSeconds',
      'setUTCSeconds',
      'setMilliseconds',
-     'setUTCMilliseconds'].forEach(makeMutableProtoPatcher(Date, 'Date'));
+     'setUTCMilliseconds'].forEach(
+         makeMutableProtoPatcher(Date, isBuiltinDate));
   }
 
   function repair_MUTABLE_WEAKMAP_PROTO() {
     // Note: coordinate this list with maintanence of whitelist.js
     ['set',
-     'delete'].forEach(makeMutableProtoPatcher(WeakMap, 'WeakMap'));
+     'delete'].forEach(makeMutableProtoPatcher(WeakMap, isBuiltinWeakMap));
   }
 
   function repair_NEED_TO_WRAP_FOREACH() {
@@ -3934,7 +5004,7 @@ var ses;
         }
         var O = Object(this);
         var len = O.length >>> 0;
-        if (objToString.call(callback) !== '[object Function]') {
+        if (typeof callback !== 'function') {
           throw new TypeError(callback + ' is not a function');
         }
         T = thisArg;
@@ -3949,66 +5019,6 @@ var ses;
         }
       }
     });
-  }
-
-
-  function repair_NEEDS_DUMMY_SETTER() {
-    var defProp = Object.defineProperty;
-    var gopd = Object.getOwnPropertyDescriptor;
-
-    function dummySetter(newValue) {
-      throw new TypeError('no setter for assigning: ' + newValue);
-    }
-    dummySetter.prototype = null;
-    rememberToTamperProof(dummySetter);
-
-    defProp(Object, 'defineProperty', {
-      value: function setSetterDefProp(base, name, desc) {
-        if (typeof desc.get === 'function' && desc.set === void 0) {
-          var oldDesc = gopd(base, name);
-          if (oldDesc) {
-            var testBase = {};
-            defProp(testBase, name, oldDesc);
-            defProp(testBase, name, desc);
-            desc = gopd(testBase, name);
-            if (desc.set === void 0) { desc.set = dummySetter; }
-          } else {
-            if (objToString.call(base) === '[object HTMLFormElement]') {
-              // This repair was triggering bug
-              // https://code.google.com/p/chromium/issues/detail?id=94666
-              // on Chrome, causing
-              // https://code.google.com/p/google-caja/issues/detail?id=1401
-              // so if base is an HTMLFormElement we skip this
-              // fix. Since this repair and this situation are both
-              // Chrome only, it is ok that we're conditioning this on
-              // the unspecified [[Class]] value of base.
-              //
-              // To avoid the further bug identified at Comment 2
-              // https://code.google.com/p/chromium/issues/detail?id=94666#c2
-              // We also have to reconstruct the requested desc so that
-              // the setter is absent. This is why we additionally
-              // condition this special case on the absence of an own
-              // name property on base.
-              var desc2 = { get: desc.get };
-              if ('enumerable' in desc) {
-                desc2.enumerable = desc.enumerable;
-              }
-              if ('configurable' in desc) {
-                desc2.configurable = desc.configurable;
-              }
-              var result = defProp(base, name, desc2);
-              var newDesc = gopd(base, name);
-              if (newDesc.get === desc.get) {
-                return result;
-              }
-            }
-            desc.set = dummySetter;
-          }
-        }
-        return defProp(base, name, desc);
-      }
-    });
-    NEEDS_DUMMY_SETTER_repaired = true;
   }
 
   function repair_JSON_PARSE_PROTO_CONFUSION() {
@@ -4123,6 +5133,37 @@ var ses;
         }
       });
     }
+  }
+
+  function repair_UNSHIFT_IGNORES_READONLY() {
+    var baseSplice = Array.prototype.splice;
+    var baseConcat = Array.prototype.concat;
+    Object.defineProperty(Array.prototype, 'unshift', {
+      value: function(var_args) {
+        var len = +this.length;
+        var items = slice.call(arguments, 0);
+        baseSplice.apply(this, baseConcat.call([0, 0], items));
+        return len + items.length;
+      },
+      configurable: true,
+      writable: true
+    });
+  }
+
+  function repair_SHIFT_IGNORES_READONLY() {
+    var baseSplice = Array.prototype.splice;
+    Object.defineProperty(Array.prototype, 'shift', {
+      value: function() {
+        if (+this.length >= 1) {
+          var result = this[0];
+          baseSplice.call(this, 0, 1);
+          return result;
+        }
+        return void 0;
+      },
+      configurable: true,
+      writable: true
+    });
   }
 
   function repair_POP_IGNORES_FROZEN() {
@@ -4292,28 +5333,6 @@ var ses;
     global.WeakMap = undefined;
   }
 
-  function repair_ERRORS_HAVE_INVISIBLE_PROPERTIES() {
-    var baseGOPN = Object.getOwnPropertyNames;
-    var baseGOPD = Object.getOwnPropertyDescriptor;
-    var errorPattern = /^\[object [\w$]*Error\]$/;
-
-    function touch(name) {
-      // the forEach will invoke this function with this === the error instance
-      baseGOPD(this, name);
-    }
-
-    Object.defineProperty(Object, 'getOwnPropertyNames', {
-      writable: true,  // allow other repairs to stack on
-      value: function repairedErrorInvisGOPN(object) {
-        // Note: not adequate in future ES6 world (TODO(erights): explain why)
-        if (errorPattern.test(objToString.call(object))) {
-          errorInstanceKnownInvisibleList.forEach(touch, object);
-        }
-        return baseGOPN(object);
-      }
-    });
-  }
-
   /**
    * Note that this repair does not repair the Function constructor
    * itself at this stage. Rather, it repairs ses.verifyStrictFunctionBody,
@@ -4346,17 +5365,18 @@ var ses;
     protos.push(global.DataView.prototype);
     protos.forEach(function(proto) {
       Object.getOwnPropertyNames(proto).forEach(function(prop) {
+        function exceptionAdapterWrapper(var_args) {
+          try {
+            origMethod.apply(this, arguments);
+          } catch (e) {
+            if (e instanceof DOMException) {
+              throw new RangeError(e.message);
+            }
+          }
+        }
         if (/^[gs]et/.test(prop)) {
           var origMethod = proto[prop];
-          proto[prop] = function exceptionAdapterWrapper(var_args) {
-            try {
-              origMethod.apply(this, arguments);
-            } catch (e) {
-              if (e instanceof DOMException) {
-                throw new RangeError(e.message);
-              }
-            }
-          };
+          proto[prop] = funcLike(exceptionAdapterWrapper, origMethod);
         }
       });
     });
@@ -4419,13 +5439,243 @@ var ses;
         return;
       }
 
-      desc.value = function globalLeakDefenseWrapper() {
+      function globalLeakDefenseWrapper() {
         // To repair this bug it is sufficient to force the method to be called
         // using .apply(), as it only occurs if it is called as a literal
         // function, e.g. var concat = Array.prototype.concat; concat().
         return existingMethod.apply(this, arguments);
-      };
+      }
+      desc.value = funcLike(globalLeakDefenseWrapper, existingMethod);
       Object.defineProperty(object, name, desc);
+    });
+  }
+
+  function repair_NUMERIC_PROPERTIES_INVISIBLE() {
+    var create = Object.create;
+
+    var tempPropName = '0';
+    var tempPropDesc = {configurable: true};
+
+    Object.defineProperty(Object, 'create', {
+      configurable: true,
+      writable: true,  // allow other repairs to stack on
+      value: function repairedCreate(prototype, props) {
+        var o = create(prototype);
+        // Any property defined using a descriptor is sufficient to suppress
+        // the misbehavior.
+        Object.defineProperty(o, tempPropName, tempPropDesc);
+        delete o[tempPropName];
+        // By deferring the defineProperties operation, we avoid possibly
+        // conflicting with the caller-specified property names, without
+        // needing to examine props twice.
+        if (props !== undefined) {
+          Object.defineProperties(o, props);
+        }
+        return o;
+      }
+    });
+  }
+
+  /**
+   * Repairs both getter and setter. If either are vulnerable, I don't
+   * care if the other seemed to pass the test. Better to make them
+   * both safe.
+   */
+  function repair_UNDERBAR_PROTO_accessors_USE_GLOBAL() {
+    var gopd = Object.getOwnPropertyDescriptor;
+
+    var oldDesc = gopd(Object.prototype, '__proto__');
+    var oldGetter = oldDesc.get;
+    var oldSetter = oldDesc.set;
+    function newGetter() {
+      if (this === null || this === void 0) {
+        throw new TypeError('Cannot convert null or undefined to object');
+      } else {
+        return oldGetter.call(this);
+      }
+    }
+    function newSetter(newProto) {
+      if (this === null || this === void 0) {
+        throw new TypeError('Cannot convert null or undefined to object');
+      } else {
+        oldSetter.call(this, newProto);
+      }
+    }
+    Object.defineProperty(Object.prototype, '__proto__', {
+      get: oldGetter ? newGetter : void 0,
+      set: oldSetter ? newSetter : void 0
+    });
+  }
+
+  /**
+   * Repairs Safari-only bug
+   * https://bugs.webkit.org/show_bug.cgi?id=141878 by preemptively
+   * adding the 'line', 'column', 'sourceUrl', and 'stack' properties
+   * to any objects that are about to become non-extensible. When
+   * these are already present, then the Safari bug does not add them.
+   */
+  function repair_THROWING_THAWS_FROZEN_OBJECT() {
+    var defProp = Object.defineProperty;
+
+    /**
+     * Preemptively add to obj, if necessary, the properties that
+     * Safari would add on throwing/catching the object.
+     */
+    preemptThaw = function(obj) {
+      strictForEachFn(['line', 'column', 'sourceUrl', 'stack'],
+                      function(name) {
+        if (!hop.call(obj, name)) {
+          try {
+            // First try adding it ourselves to prevent the side
+            // channel that would happen when the throw and catch of
+            // obj below would add values according to its calling
+            // stack.
+            defProp(obj, name, {
+              value: void 0, // so naive feature tests will still fail
+              writable: false,
+              enumerable: false, // so it is invisible to ES3 iteration
+              configurable: true // so tamperProof can turn the data
+                                 // property into an accessor, to cope
+                                 // with the override mistake
+            });
+          } catch (ignoredErr) {}
+        }
+      });
+      // If the object was already non-extensible somehow, then the
+      // above defProp may have failed to add the property. So this
+      // throw-catch adds whatever remaining properties this bug would
+      // add. In this case, there may be a side channel, revealing
+      // information about the caller of preemptThaw. But at least it
+      // happens now, when it is less dangerous, before the monkey
+      // patched freeze, seal, or preventExtensions returns.
+      try { throw obj; } catch (_) {}
+    }
+
+    var oldFreeze = Object.freeze;
+    defProp(Object, 'freeze', {
+      value: function antithawFreeze(obj) {
+        preemptThaw(obj);
+        return oldFreeze(obj);
+      }
+    });
+
+    var oldSeal = Object.seal;
+    defProp(Object, 'seal', {
+      value: function antithawSeal(obj) {
+        preemptThaw(obj);
+        return oldSeal(obj);
+      }
+    });
+
+    var oldPreventExtensions = Object.preventExtensions;
+    defProp(Object, 'preventExtensions', {
+      value: function antithawPreventExtensions(obj) {
+        preemptThaw(obj);
+        return oldPreventExtensions(obj);
+      }
+    });
+  }
+
+  /**
+   * According to
+   * https://bugzilla.mozilla.org/show_bug.cgi?id=1125389#c28 comment 28
+   * <blockquote>
+   *   <blockquote>
+   *      [...] is there anything that content script could do to prevent
+   *      this bug from occurring?
+   *   </blockquote>
+   *     [...] If the object which preventExtensions is called on has
+   *     any properties which are non-configurable or non-writable
+   *     then the bug won't impact anything (so calling seal() or
+   *     freeze() on an object with at least one property shouldn't be
+   *     able to trigger this bug)
+   * </blockquote>
+   *
+   * <p>WeakMap.js, if it needs to install a WeakMap emulation, does
+   * so by adding a hidden own property to objects at the time they
+   * would be made non-extensible, by monkey patching those functions
+   * that would make them non-extensible. It also monkey patches those
+   * functions that would reveal non-enumerable own properties, so
+   * that they don't reveal this hidden property.
+   *
+   * <p>Were both this repair and the WeakMap emulation of more long
+   * term interest, we should find a way to reuse this monkey patching
+   * logic, so the same monkey patching could serve both purposes. As
+   * it is, this repair becomes unneeded as of FF36, as the underlying
+   * problem is fixed there, so we expediently that part of
+   * WeakMap.js's logic without worrying about reusable
+   * abstractions. Unlike the WeakMap fix, here, the hidden property
+   * need not be unguessage, but only resistent to accidental
+   * collision. If the WeakMap installation repair happens on top of
+   * this one, they should compose fine.
+   */
+  function repair_NON_EXTENSIBLES_EXTENSIBLE() {
+    var gopn = Object.getOwnPropertyNames;
+    var defProp = Object.defineProperty;
+    var isExtensible = Object.isExtensible;
+
+    var DUMMY_NAME = '___j9d04gcuzydmfgvi___';
+
+    function isNotDummyName(name) { return name !== DUMMY_NAME; }
+
+    // For all calls to Object.defineProperty (defProp) to redefine an
+    // existing property, keep in mind that omitting some attributes,
+    // like writable:, enumerable:, or configurable:, means that the
+    // current setting of these attributes should be preseved, rather
+    // than defaulting to false.
+
+    // Note that the use of .filter as an array instance method below
+    // only works in SES under the immutable primordials
+    // assumption. For example, it would not work in CES (Confined
+    // EcmaScript).
+
+    defProp(Object, 'getOwnPropertyNames', {
+      value: function nonDummyGetOwnPropertyNames(obj) {
+        return gopn(obj).filter(isNotDummyName);
+      }
+    });
+    if ('getPropertyNames' in Object) {
+      var originalGetPropertyNames = Object.getPropertyNames;
+      defProp(Object, 'getPropertyNames', {
+        value: function nonDummyGetPropertyNames(obj) {
+          return originalGetPropertyNames(obj).filter(isNotDummyName);
+        }
+      });
+    }
+
+    function addDummyProperty(obj) {
+      if (obj !== Object(obj)) { return; }
+      if (!Object.isExtensible(obj)) { return; }
+      defProp(obj, DUMMY_NAME, {
+        value: 'DUMMY',
+        writable: false,
+        enumerable: false,
+        configurable: false
+      });
+    }
+
+    var oldFreeze = Object.freeze;
+    defProp(Object, 'freeze', {
+      value: function bogosifyingFreeze(obj) {
+        addDummyProperty(obj);
+        return oldFreeze(obj);
+      }
+    });
+
+    var oldSeal = Object.seal;
+    defProp(Object, 'seal', {
+      value: function bogosifyingSeal(obj) {
+        addDummyProperty(obj);
+        return oldSeal(obj);
+      }
+    });
+
+    var oldPreventExtensions = Object.preventExtensions;
+    defProp(Object, 'preventExtensions', {
+      value: function bogosifyingPreventExtensions(obj) {
+        addDummyProperty(obj);
+        return oldPreventExtensions(obj);
+      }
     });
   }
 
@@ -4434,9 +5684,93 @@ var ses;
   // These are tests and repairs which follow a pattern, such that it is
   // more practical to define them programmatically.
 
-  function arrayMutatorProblem(destination, prop, testArgs) {
+  function arrayPutProblem(destination,
+                           prop, testArgs, i, expected, kind, opt_repair) {
+    var pos = ['first', 'last'][i];
+    var descs = {
+      readonly: {writable: false, configurable: false},
+      non_writable: {writable: false}
+    };
+    var badness = {
+      readonly: severities.UNSAFE_SPEC_VIOLATION,
+      non_writable: severities.SAFE_SPEC_VIOLATION
+    };
+
     /**
-     * Tests only for likley symptoms of a seal violation or a
+     * Tests for an array method modifying the value of a non-writable
+     * indexed data property of an array.
+     */
+    function test_method_IGNORES_kind() {
+      var x = ['c', 'b'];
+      var val = x[i];
+      Object.defineProperty(x, i, descs[kind]);
+      try {
+        x[prop].apply(x, testArgs);
+      } catch (_) {
+        if (x[i] === val) { return false; }
+        return 'Unexpected error on ' + prop +
+          ' of a ' + kind + ' property: ' + x;
+      }
+      if (x[i] === val) {
+        // The problem is not that the PUT was ignored, but that
+        // it didn't throw, which is detected by
+        // test_method_DOESNT_THROW_kind() below.
+        return false;
+      }
+      if (x[i] === expected) { return true; }
+      return 'Unexpected behavior on ' + prop +
+        ' of a ' + kind + ' property: ' + x;
+    }
+
+    /**
+     * Tests for an array method not throwing when it tries to modify
+     * the value of a non-writable indexed data property of an array.
+     */
+    function test_method_DOESNT_THROW_kind() {
+      var x = ['c', 'b'];
+      var val = x[i];
+      Object.defineProperty(x, i, descs[kind]);
+      try {
+        x[prop].apply(x, testArgs);
+      } catch (_) {
+        return false;
+      }
+      return true;
+    }
+
+    destination.push({
+      id: (prop + '_PUT_IGNORES_' + pos + '_' + kind).toUpperCase(),
+      description: 'Array.prototype.' + prop + ' ignores ' +
+        kind + ' on ' + pos + ' property',
+      test: test_method_IGNORES_kind,
+      repair: opt_repair,
+      preSeverity: badness[kind],
+      canRepair: opt_repair !== void 0,
+      urls: ['https://code.google.com/p/v8/issues/detail?id=3356',
+             'https://code.google.com/p/google-caja/issues/detail?id=1931',
+             'https://code.google.com/p/v8/issues/detail?id=2615'],
+      sections: [],
+      tests: [] // TODO(jasvir): Add to test262
+    });
+    destination.push({
+      id: (prop + '_PUT_DOESNT_THROW_' + pos + '_' + kind).toUpperCase(),
+      description: 'Array.prototype.' + prop + ' doesn\'t throw on ' +
+        kind + ' ' + pos + ' property',
+      test: test_method_DOESNT_THROW_kind,
+      repair: opt_repair,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: opt_repair !== void 0,
+      urls: ['https://code.google.com/p/v8/issues/detail?id=3356',
+             'https://code.google.com/p/google-caja/issues/detail?id=1931',
+             'https://code.google.com/p/v8/issues/detail?id=2615'],
+      sections: [],
+      tests: [] // TODO(jasvir): Add to test262
+    });
+  }
+
+  function arraySealProblem(destination, prop, testArgs) {
+    /**
+     * Tests only for likely symptoms of a seal violation or a
      * malformed array.
      *
      * <p>A sealed object can neither acquire new own properties
@@ -4488,13 +5822,14 @@ var ses;
     function repair_method_IGNORES_SEALED() {
       var originalMethod = Array.prototype[prop];
       var isSealed = Object.isSealed;
+      function repairedArrayMutator(var_args) {
+        if (isSealed(this)) {
+          throw new TypeError('Cannot mutate a sealed array.');
+        }
+        return originalMethod.apply(this, arguments);
+      }
       Object.defineProperty(Array.prototype, prop, {
-        value: function repairedArrayMutator(var_args) {
-          if (isSealed(this)) {
-            throw new TypeError('Cannot mutate a sealed array.');
-          }
-          return originalMethod.apply(this, arguments);
-        },
+        value: funcLike(repairedArrayMutator, originalMethod),
         configurable: true,
         writable: true
       });
@@ -4531,9 +5866,6 @@ var ses;
 
   ////////////////////// Problem Records /////////////////////
 
-  var severities = ses.severities;
-  var statuses = ses.statuses;
-
   /**
    * First test whether the platform can even support our repair
    * attempts.
@@ -4548,7 +5880,7 @@ var ses;
       canRepair: false,
       urls: [],
       sections: ['15.2.3.4'],
-      tests: ['15.2.3.4-0-1']
+      tests: ['test/built-ins/Object/getOwnPropertyNames/15.2.3.4-0-1.js']
     },
     {
       id: 'PROTO_SETTER_UNGETTABLE',
@@ -4576,7 +5908,7 @@ var ses;
       canRepair: false,  // Not repairable without rewriting
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=64250'],
       sections: ['10.2.1.2', '10.2.1.2.6'],
-      tests: ['10.4.3-1-8gs']
+      tests: ['test/language/function-code/10.4.3-1-8gs.js']
     },
     {
       id: 'GLOBAL_LEAKS_FROM_ANON_FUNCTION_CALLS',
@@ -4587,7 +5919,7 @@ var ses;
       canRepair: false,
       urls: [],
       sections: ['10.4.3'],
-      tests: ['S10.4.3_A1']
+      tests: ['test/language/function-code/S10.4.3_A1.js']
     },
     {
       id: 'GLOBAL_LEAKS_FROM_STRICT_THIS',
@@ -4598,7 +5930,8 @@ var ses;
       canRepair: false,  // Not repairable without rewriting
       urls: [],
       sections: ['10.4.3'],
-      tests: ['10.4.3-1-8gs', '10.4.3-1-8-s']
+      tests: ['test/language/function-code/10.4.3-1-8gs.js',
+              'test/language/function-code/10.4.3-1-8-s.js']
     },
     {
       id: 'GLOBAL_LEAKS_FROM_BUILTINS',
@@ -4614,7 +5947,7 @@ var ses;
              'https://connect.microsoft.com/IE/feedback/details/' +
                '685430/global-object-leaks-from-built-in-methods'],
       sections: ['15.2.4.4'],
-      tests: ['S15.2.4.4_A14']
+      tests: ['test/built-ins/Object/prototype/valueOf/S15.2.4.4_A14.js']
     },
     {
       id: 'GLOBAL_LEAKS_FROM_GLOBALLY_CALLED_BUILTINS',
@@ -4626,7 +5959,7 @@ var ses;
           // so it's not worth creating a repair for this bug.
       urls: [],
       sections: ['10.2.1.2', '10.2.1.2.6', '15.2.4.4'],
-      tests: ['S15.2.4.4_A15']
+      tests: ['test/built-ins/Object/prototype/valueOf/S15.2.4.4_A15.js']
     },
     {
       id: 'MISSING_FREEZE_ETC',
@@ -4637,7 +5970,7 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=55736'],
       sections: ['15.2.3.9'],
-      tests: ['15.2.3.9-0-1']
+      tests: ['test/built-ins/Object/freeze/15.2.3.9-0-1.js']
     },
     {
       id: 'FUNCTION_PROTOTYPE_DESCRIPTOR_LIES',
@@ -4649,7 +5982,7 @@ var ses;
       urls: ['https://code.google.com/p/v8/issues/detail?id=1530',
              'https://code.google.com/p/v8/issues/detail?id=1570'],
       sections: ['15.2.3.3', '15.2.3.6', '15.3.5.2'],
-      tests: ['S15.3.3.1_A4']
+      tests: ['test/built-ins/Function/prototype/S15.3.3.1_A4.js']
     },
     {
       id: 'MISSING_CALLEE_DESCRIPTOR',
@@ -4660,7 +5993,7 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=55537'],
       sections: ['15.2.3.4'],
-      tests: ['S15.2.3.4_A1_T1']
+      tests: ['test/built-ins/Object/getOwnPropertyNames/S15.2.3.4_A1_T1.js']
     },
     {
       id: 'STRICT_DELETE_RETURNS_FALSE',
@@ -4673,7 +6006,7 @@ var ses;
                '685432/strict-delete-sometimes-returns-false-' +
                'rather-than-throwing'],
       sections: ['11.4.1'],
-      tests: ['S11.4.1_A5']
+      tests: ['test/language/expressions/delete/S11.4.1_A5.js']
     },
     {
       id: 'REGEXP_CANT_BE_NEUTERED',
@@ -4690,7 +6023,7 @@ var ses;
                '685439/non-deletable-regexp-statics-are-a-global-' +
                'communication-channel'],
       sections: ['11.4.1'],
-      tests: ['S11.4.1_A5']
+      tests: ['test/language/expressions/delete/S11.4.1_A5.js']
     },
     {
       id: 'REGEXP_TEST_EXEC_UNSAFE',
@@ -4704,7 +6037,7 @@ var ses;
              'https://bugzilla.mozilla.org/show_bug.cgi?id=635017',
              'https://code.google.com/p/google-caja/issues/detail?id=528'],
       sections: ['15.10.6.2'],
-      tests: ['S15.10.6.2_A12']
+      tests: ['test/built-ins/RegExp/prototype/exec/S15.10.6.2_A12.js']
     },
     {
       id: 'MISSING_BIND',
@@ -4716,7 +6049,7 @@ var ses;
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=26382',
              'https://bugs.webkit.org/show_bug.cgi?id=42371'],
       sections: ['15.3.4.5'],
-      tests: ['S15.3.4.5_A3']
+      tests: ['test/built-ins/Function/prototype/bind/S15.3.4.5_A3.js']
     },
     {
       id: 'BIND_CALLS_APPLY',
@@ -4728,7 +6061,7 @@ var ses;
       urls: ['https://code.google.com/p/v8/issues/detail?id=892',
              'https://code.google.com/p/v8/issues/detail?id=828'],
       sections: ['15.3.4.5.1'],
-      tests: ['S15.3.4.5_A4']
+      tests: ['test/built-ins/Function/prototype/bind/S15.3.4.5_A4.js']
     },
     {
       id: 'BIND_CANT_CURRY_NEW',
@@ -4739,7 +6072,7 @@ var ses;
       canRepair: false,  // JS-based repair essentially impossible
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=26382#c29'],
       sections: ['15.3.4.5.2'],
-      tests: ['S15.3.4.5_A5']
+      tests: ['test/built-ins/Function/prototype/bind/S15.3.4.5_A5.js']
     },
     {
       id: 'MUTABLE_DATE_PROTO',
@@ -4748,7 +6081,12 @@ var ses;
       repair: repair_MUTABLE_DATE_PROTO,
       preSeverity: severities.NOT_OCAP_SAFE,
       canRepair: true,
-      urls: ['https://code.google.com/p/google-caja/issues/detail?id=1362'],
+      urls: ['https://code.google.com/p/google-caja/issues/detail?id=1362',
+             'https://bugzilla.mozilla.org/show_bug.cgi?id=797686',
+             'https://bugzilla.mozilla.org/show_bug.cgi?id=861219',
+             'https://code.google.com/p/v8/issues/detail?id=3890',
+             'https://bugs.webkit.org/show_bug.cgi?id=141610',
+             'https://connect.microsoft.com/IE/feedbackdetail/view/1131123/for-many-x-x-prototype-is-an-x-when-it-must-be-a-plain-object'],
       sections: ['15.9.5'],
       tests: []
     },
@@ -4759,7 +6097,64 @@ var ses;
       repair: repair_MUTABLE_WEAKMAP_PROTO,
       preSeverity: severities.NOT_OCAP_SAFE,
       canRepair: true,
-      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=656828'],
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=656828',
+             'https://bugzilla.mozilla.org/show_bug.cgi?id=797686'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'NUMBER_PROTO_IS_NUMBER',
+      description: 'Number.prototype should be a plain object',
+      test: test_NUMBER_PROTO_IS_NUMBER,
+      repair: void 0,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=797686',
+             'https://code.google.com/p/v8/issues/detail?id=3890',
+             'https://bugs.webkit.org/show_bug.cgi?id=141610',
+             'https://connect.microsoft.com/IE/feedbackdetail/view/1131123/for-many-x-x-prototype-is-an-x-when-it-must-be-a-plain-object'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'BOOLEAN_PROTO_IS_BOOLEAN',
+      description: 'Boolean.prototype should be a plain object',
+      test: test_BOOLEAN_PROTO_IS_BOOLEAN,
+      repair: void 0,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=797686',
+             'https://code.google.com/p/v8/issues/detail?id=3890',
+             'https://bugs.webkit.org/show_bug.cgi?id=141610',
+             'https://connect.microsoft.com/IE/feedbackdetail/view/1131123/for-many-x-x-prototype-is-an-x-when-it-must-be-a-plain-object'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'STRING_PROTO_IS_STRING',
+      description: 'String.prototype should be a plain object',
+      test: test_STRING_PROTO_IS_STRING,
+      repair: void 0,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=797686',
+             'https://code.google.com/p/v8/issues/detail?id=3890',
+             'https://bugs.webkit.org/show_bug.cgi?id=141610',
+             'https://connect.microsoft.com/IE/feedbackdetail/view/1131123/for-many-x-x-prototype-is-an-x-when-it-must-be-a-plain-object'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'REGEXP_PROTO_IS_REGEXP',
+      description: 'RegExp.prototype should be a plain object',
+      test: test_REGEXP_PROTO_IS_REGEXP,
+      repair: void 0,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=797686',
+             'https://code.google.com/p/v8/issues/detail?id=3890',
+             'https://bugs.webkit.org/show_bug.cgi?id=141610',
+             'https://connect.microsoft.com/IE/feedbackdetail/view/1131123/for-many-x-x-prototype-is-an-x-when-it-must-be-a-plain-object'],
       sections: [],
       tests: []
     },
@@ -4772,7 +6167,8 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://code.google.com/p/v8/issues/detail?id=1447'],
       sections: ['15.4.4.18'],
-      tests: ['S15.4.4.18_A1', 'S15.4.4.18_A2']
+      tests: ['test/built-ins/Array/prototype/forEach/S15.4.4.18_A1.js',
+              'test/built-ins/Array/prototype/forEach/S15.4.4.18_A2.js']
     },
     {
       id: 'FOREACH_COERCES_THISOBJ',
@@ -4791,10 +6187,10 @@ var ses;
       id: 'NEEDS_DUMMY_SETTER',
       description: 'Workaround undiagnosed need for dummy setter',
       test: test_NEEDS_DUMMY_SETTER,
-      repair: repair_NEEDS_DUMMY_SETTER,
+      repair: void 0,
       preSeverity: severities.UNSAFE_SPEC_VIOLATION,
-      canRepair: true,
-      urls: [],
+      canRepair: false,  // Long-dead bug, not worth keeping old repair around
+      urls: ['https://code.google.com/p/chromium/issues/detail?id=94666'],
       sections: [],
       tests: []
     },
@@ -4809,7 +6205,7 @@ var ses;
              'https://code.google.com/p/v8/issues/detail?id=1651',
              'https://code.google.com/p/google-caja/issues/detail?id=1401'],
       sections: ['15.2.3.6'],
-      tests: ['S15.2.3.6_A1']
+      tests: ['test/built-ins/Object/defineProperty/S15.2.3.6_A1.js']
     },
     {
       id: 'ACCESSORS_INHERIT_AS_OWN',
@@ -4820,7 +6216,7 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=637994'],
       sections: ['8.6.1', '15.2.3.6'],
-      tests: ['S15.2.3.6_A2']
+      tests: ['test/built-ins/Object/defineProperty/S15.2.3.6_A2.js']
     },
     {
       id: 'SORT_LEAKS_GLOBAL',
@@ -4831,7 +6227,7 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://code.google.com/p/v8/issues/detail?id=1360'],
       sections: ['15.4.4.11'],
-      tests: ['S15.4.4.11_A8']
+      tests: ['test/built-ins/Array/prototype/sort/S15.4.4.11_A8.js']
     },
     {
       id: 'REPLACE_LEAKS_GLOBAL',
@@ -4845,7 +6241,7 @@ var ses;
                '685928/bad-this-binding-for-callback-in-string-' +
                'prototype-replace'],
       sections: ['15.5.4.11'],
-      tests: ['S15.5.4.11_A12']
+      tests: ['test/built-ins/String/prototype/replace/S15.5.4.11_A12.js']
     },
     {
       id: 'CANT_GOPD_CALLER',
@@ -4857,7 +6253,7 @@ var ses;
       urls: ['https://connect.microsoft.com/IE/feedback/details/' +
                '685436/getownpropertydescriptor-on-strict-caller-throws'],
       sections: ['15.2.3.3', '13.2', '13.2.3'],
-      tests: ['S13.2_A6_T1']
+      tests: ['test/language/statements/function/S13.2_A6_T1.js']
     },
     {
       id: 'CANT_HASOWNPROPERTY_CALLER',
@@ -4868,7 +6264,7 @@ var ses;
       canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=63398#c3'],
       sections: ['15.2.4.5', '13.2', '13.2.3'],
-      tests: ['S13.2_A7_T1']
+      tests: ['test/language/statements/function/S13.2_A7_T1.js']
     },
     {
       id: 'CANT_IN_CALLER',
@@ -4879,7 +6275,7 @@ var ses;
       canRepair: false,
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=63398'],
       sections: ['11.8.7', '13.2', '13.2.3'],
-      tests: ['S13.2_A8_T1']
+      tests: ['test/language/statements/function/S13.2_A8_T1.js']
     },
     {
       id: 'CANT_IN_ARGUMENTS',
@@ -4890,7 +6286,7 @@ var ses;
       canRepair: false,
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=63398'],
       sections: ['11.8.7', '13.2', '13.2.3'],
-      tests: ['S13.2_A8_T2']
+      tests: ['test/language/statements/function/S13.2_A8_T2.js']
     },
     {
       id: 'STRICT_CALLER_NOT_POISONED',
@@ -4901,7 +6297,7 @@ var ses;
       canRepair: false,
       urls: [],
       sections: ['13.2'],
-      tests: ['S13.2.3_A1']
+      tests: ['test/language/statements/function/S13.2.3_A1.js']
     },
     {
       id: 'STRICT_ARGUMENTS_NOT_POISONED',
@@ -4912,7 +6308,7 @@ var ses;
       canRepair: false,
       urls: [],
       sections: ['13.2'],
-      tests: ['S13.2.3_A1']
+      tests: ['test/language/statements/function/S13.2.3_A1.js']
     },
     {
       id: 'BUILTIN_LEAKS_CALLER',
@@ -4927,7 +6323,7 @@ var ses;
              'http://wiki.ecmascript.org/doku.php?id=' +
                'conventions:make_non-standard_properties_configurable'],
       sections: [],
-      tests: ['Sbp_A10_T1']
+      tests: ['https://github.com/tc39/test262/blob/b752d2fdde2d3a49619735ed3713f6c287667c6d/test/suite/bestPractice/Sbp_A10_T1.js']
     },
     {
       id: 'BUILTIN_LEAKS_ARGUMENTS',
@@ -4942,7 +6338,7 @@ var ses;
              'http://wiki.ecmascript.org/doku.php?id=' +
                'conventions:make_non-standard_properties_configurable'],
       sections: [],
-      tests: ['Sbp_A10_T2']
+      tests: ['https://github.com/tc39/test262/blob/b752d2fdde2d3a49619735ed3713f6c287667c6d/test/suite/bestPractice/Sbp_A10_T2.js']
     },
     {
       id: 'BOUND_FUNCTION_LEAKS_CALLER',
@@ -4954,7 +6350,8 @@ var ses;
       urls: ['https://code.google.com/p/v8/issues/detail?id=893',
              'https://bugs.webkit.org/show_bug.cgi?id=63398'],
       sections: ['15.3.4.5'],
-      tests: ['S13.2.3_A1', 'S15.3.4.5_A1']
+      tests: ['test/language/statements/function/S13.2.3_A1.js',
+              'test/built-ins/Function/prototype/bind/S15.3.4.5_A1.js']
     },
     {
       id: 'BOUND_FUNCTION_LEAKS_ARGUMENTS',
@@ -4966,7 +6363,8 @@ var ses;
       urls: ['https://code.google.com/p/v8/issues/detail?id=893',
              'https://bugs.webkit.org/show_bug.cgi?id=63398'],
       sections: ['15.3.4.5'],
-      tests: ['S13.2.3_A1', 'S15.3.4.5_A2']
+      tests: ['test/language/statements/function/S13.2.3_A1.js',
+              'test/built-ins/Function/prototype/bind/S15.3.4.5_A2.js']
     },
     {
       id: 'DELETED_BUILTINS_IN_OWN_NAMES',
@@ -5000,7 +6398,7 @@ var ses;
       urls: ['https://code.google.com/p/v8/issues/detail?id=621',
              'https://code.google.com/p/v8/issues/detail?id=1310'],
       sections: ['15.12.2'],
-      tests: ['S15.12.2_A1']
+      tests: ['test/built-ins/JSON/parse/S15.12.2_A1.js']
     },
     {
       id: 'PROTO_NOT_FROZEN',
@@ -5013,7 +6411,7 @@ var ses;
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=65832',
              'https://bugs.webkit.org/show_bug.cgi?id=78438'],
       sections: ['8.6.2'],
-      tests: ['S8.6.2_A8']
+      tests: ['test/language/types/object/S8.6.2_A8.js']
     },
     {
       id: 'PROTO_REDEFINABLE',
@@ -5025,7 +6423,7 @@ var ses;
           // so it's not worth creating a repair for this bug.
       urls: ['https://bugs.webkit.org/show_bug.cgi?id=65832'],
       sections: ['8.6.2'],
-      tests: ['S8.6.2_A8']
+      tests: ['test/language/types/object/S8.6.2_A8.js']
     },
     {
       id: 'DEFINING_READ_ONLY_PROTO_FAILS_SILENTLY',
@@ -5039,6 +6437,18 @@ var ses;
       tests: [] // TODO(jasvir): Add to test262
     },
     {
+      id: 'DEFINE_PROPERTY_CONFUSES_FUNC_PROTO',
+      description: 'Setting a function\'s prototype with defineProperty ' +
+        'doesn\'t change its value',
+      test: test_DEFINE_PROPERTY_CONFUSES_FUNC_PROTO,
+      repair: repair_DEFINE_PROPERTY,
+      preSeverity: severities.UNSAFE_SPEC_VIOLATION,
+      canRepair: true,
+      urls: ['https://code.google.com/p/v8/issues/detail?id=3334'],
+      sections: [],
+      tests: []  // TODO(kpreid): contribute tests
+    },
+    {
       id: 'STRICT_EVAL_LEAKS_GLOBAL_VARS',
       description: 'Strict eval function leaks variable definitions',
       test: test_STRICT_EVAL_LEAKS_GLOBAL_VARS,
@@ -5048,7 +6458,7 @@ var ses;
           // so it's not worth creating a repair for this bug.
       urls: ['https://code.google.com/p/v8/issues/detail?id=1624'],
       sections: ['10.4.2.1'],
-      tests: ['S10.4.2.1_A1']
+      tests: ['test/language/eval-code/S10.4.2.1_A1.js']
     },
     {
       id: 'STRICT_EVAL_LEAKS_GLOBAL_FUNCS',
@@ -5060,7 +6470,7 @@ var ses;
           // so it's not worth creating a repair for this bug.
       urls: ['https://code.google.com/p/v8/issues/detail?id=1624'],
       sections: ['10.4.2.1'],
-      tests: ['S10.4.2.1_A1']
+      tests: ['test/language/eval-code/S10.4.2.1_A1.js']
     },
     {
       id: 'EVAL_BREAKS_MASKING',
@@ -5083,7 +6493,7 @@ var ses;
       canRepair: true,
       urls: ['https://code.google.com/p/v8/issues/detail?id=1645'],
       sections: ['15.1.2.2'],
-      tests: ['S15.1.2.2_A5.1_T1']
+      tests: ['test/built-ins/parseInt/S15.1.2.2_A5.1_T1.js']
     },
     {
       id: 'STRICT_E4X_LITERALS_ALLOWED',
@@ -5112,7 +6522,7 @@ var ses;
              'http://wiki.ecmascript.org/doku.php?id=strawman:' +
                'fixing_override_mistake'],
       sections: ['8.12.4'],
-      tests: ['15.2.3.6-4-405']
+      tests: ['test/built-ins/Object/defineProperty/15.2.3.6-4-405.js']
     },
     {
       id: 'INCREMENT_IGNORES_FROZEN',
@@ -5262,9 +6672,9 @@ var ses;
       id: 'ERRORS_HAVE_INVISIBLE_PROPERTIES',
       description: 'Error instances have invisible properties',
       test: test_ERRORS_HAVE_INVISIBLE_PROPERTIES,
-      repair: repair_ERRORS_HAVE_INVISIBLE_PROPERTIES,
+      repair: void 0,
       preSeverity: severities.SAFE_SPEC_VIOLATION,
-      canRepair: true,
+      canRepair: false,  // Long-dead bug, not worth keeping old repair around
       urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=726477',
              'https://bugzilla.mozilla.org/show_bug.cgi?id=724768'],
       sections: [],
@@ -5284,7 +6694,7 @@ var ses;
              'https://bugzilla.mozilla.org/show_bug.cgi?id=732669'],
              // Opera DSK-358415
       sections: ['10.4.3'],
-      tests: ['10.4.3-1-59-s']
+      tests: ['test/language/function-code/10.4.3-1-59-s.js']
     },
     {
       id: 'NON_STRICT_GETTER_DOESNT_BOX',
@@ -5297,7 +6707,7 @@ var ses;
              'https://code.google.com/p/v8/issues/detail?id=1977',
              'https://bugzilla.mozilla.org/show_bug.cgi?id=732669'],
       sections: ['10.4.3'],
-      tests: ['10.4.3-1-59-s']
+      tests: ['test/language/function-code/10.4.3-1-59-s.js']
     },
     {
       id: 'NONCONFIGURABLE_OWN_PROTO',
@@ -5335,8 +6745,19 @@ var ses;
       tests: []  // TODO(kpreid): cite when ES6 is final
     },
     {
+      id: 'THROWTYPEERROR_NOT_UNIQUE',
+      description: '%ThrowTypeError% is not unique',
+      test: test_THROWTYPEERROR_NOT_UNIQUE,
+      repair: void 0,
+      preSeverity: severities.UNSAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: [],
+      sections: [],
+      tests: []
+    },
+    {
       id: 'THROWTYPEERROR_UNFROZEN',
-      description: '[[ThrowTypeError]] is not frozen',
+      description: '%ThrowTypeError% is not frozen',
       test: test_THROWTYPEERROR_UNFROZEN,
       repair: void 0,
       preSeverity: severities.SAFE_SPEC_VIOLATION,  // Note: Safe only because
@@ -5351,7 +6772,7 @@ var ses;
     },
     {
       id: 'THROWTYPEERROR_PROPERTIES',
-      description: '[[ThrowTypeError]] has normal function properties',
+      description: '%ThrowTypeError% has normal function properties',
       test: test_THROWTYPEERROR_PROPERTIES,
       repair: void 0,
       preSeverity: severities.SAFE_SPEC_VIOLATION,
@@ -5427,8 +6848,182 @@ var ses;
              'http://wiki.ecmascript.org/doku.php?id=conventions:recommendations_for_implementors'],
       sections: [],
       tests: []  // hopefully will be in ES6 tests
+    },
+    {
+      id: 'NUMERIC_PROPERTIES_INVISIBLE',
+      description: 'Numeric properties not reflectable on create()d objects',
+      test: test_NUMERIC_PROPERTIES_INVISIBLE,
+      repair: repair_NUMERIC_PROPERTIES_INVISIBLE,
+      preSeverity: severities.UNSAFE_SPEC_VIOLATION,
+      canRepair: true,
+      urls: ['http://webreflection.blogspot.co.uk/2014/04/all-ie-objects-are-broken.html'],
+          // TODO(kpreid): link Microsoft info page when available
+      sections: ['8.12.6'],
+      tests: []  // TODO(kpreid): contribute tests
+    },
+    {
+      id: 'GENERATORFUNCTION_CANNOT_BE_DENIED',
+      description: 'Cannot deny access to unsafe %GeneratorFunction%',
+      test: test_GENERATORFUNCTION_CANNOT_BE_DENIED,
+      repair: void 0,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: false,
+      urls: ['https://code.google.com/p/google-caja/issues/detail?id=1953',
+             'https://code.google.com/p/v8/issues/detail?id=3902',
+             'https://code.google.com/p/chromium/issues/detail?id=460145',
+             'https://people.mozilla.org/~jorendorff/es6-draft.html#sec-generatorfunction.prototype.constructor'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'IMPORT_CAN_BE_EVALLED',
+      description: 'Import statement evaluates outside module source text',
+      test: test_IMPORT_CAN_BE_EVALLED,
+      repair: void 0,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: false,
+      urls: [],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'UNDERBAR_PROTO_GETTER_USES_GLOBAL',
+      description: 'The getter of __proto__ coerces "this" to global',
+      test: test_UNDERBAR_PROTO_GETTER_USES_GLOBAL,
+      repair: repair_UNDERBAR_PROTO_accessors_USE_GLOBAL,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: true,
+      urls: ['https://bugs.webkit.org/show_bug.cgi?id=141865'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'UNDERBAR_PROTO_SETTER_USES_GLOBAL',
+      description: 'The setter of __proto__ coerces "this" to global',
+      test: test_UNDERBAR_PROTO_SETTER_USES_GLOBAL,
+      repair: repair_UNDERBAR_PROTO_accessors_USE_GLOBAL,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: true,
+      urls: ['https://bugs.webkit.org/show_bug.cgi?id=141865'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'THROWING_THAWS_FROZEN_OBJECT',
+      description: 'Throwing a frozen object opens a capability leak',
+      test: test_THROWING_THAWS_FROZEN_OBJECT,
+      repair: repair_THROWING_THAWS_FROZEN_OBJECT,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: true,
+      urls: ['https://bugs.webkit.org/show_bug.cgi?id=141871',
+             'https://bugs.webkit.org/show_bug.cgi?id=141878'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'NON_EXTENSIBLES_EXTENSIBLE',
+      description: 'Non-extensible objects can be extended',
+      test: test_NON_EXTENSIBLES_EXTENSIBLE,
+      repair: repair_NON_EXTENSIBLES_EXTENSIBLE,
+      preSeverity: severities.NOT_ISOLATED,
+      canRepair: true,
+      urls: ['https://bugzilla.mozilla.org/show_bug.cgi?id=1125389',
+             'https://code.google.com/p/google-caja/issues/detail?id=1954'],
+      sections: [],
+      tests: []
+    },
+    {
+      id: 'CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT',
+      description: 'Cross-frame for/in needs non-standard inherited .next',
+      test: test_CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT,
+      repair: void 0,
+      preSeverity: severities.SAFE_SPEC_VIOLATION,
+      canRepair: false,
+      urls: ['https://code.google.com/p/google-caja/issues/detail?id=1962',
+             'https://bugzilla.mozilla.org/show_bug.cgi?id=1152550'],
+      sections: [],
+      tests: []
     }
   ];
+
+  // SPLICE_PUT_IGNORES_FIRST_READONLY
+  // SPLICE_PUT_DOESNT_THROW_FIRST_READONLY
+  // SPLICE_PUT_IGNORES_FIRST_NON_WRITABLE
+  // SPLICE_PUT_DOESNT_THROW_FIRST_NON_WRITABLE
+  // SPLICE_PUT_IGNORES_LAST_READONLY
+  // SPLICE_PUT_DOESNT_THROW_LAST_READONLY
+  arrayPutProblem(supportedProblems,
+                  'splice', [0, 0, 'a'], 0, 'a', 'readonly');
+  arrayPutProblem(supportedProblems,
+                  'splice', [0, 0, 'a'], 0, 'a', 'non_writable');
+  arrayPutProblem(supportedProblems,
+                  'splice', [1, 1], 1, void 0, 'readonly');
+
+  // POP_PUT_IGNORES_LAST_READONLY
+  // POP_PUT_DOESNT_THROW_LAST_READONLY
+  arrayPutProblem(supportedProblems,
+                  'pop', [], 1, void 0, 'readonly');
+
+  // UNSHIFT_PUT_IGNORES_FIRST_READONLY
+  // UNSHIFT_PUT_DOESNT_THROW_FIRST_READONLY
+  // UNSHIFT_PUT_IGNORES_FIRST_NON_WRITABLE
+  // UNSHIFT_PUT_DOESNT_THROW_FIRST_NON_WRITABLE
+  arrayPutProblem(supportedProblems,
+                  'unshift', ['a'], 0, 'a', 'readonly',
+                  repair_UNSHIFT_IGNORES_READONLY);
+  arrayPutProblem(supportedProblems,
+                  'unshift', ['a'], 0, 'a', 'non_writable',
+                  repair_UNSHIFT_IGNORES_READONLY);
+
+  // SHIFT_PUT_IGNORES_FIRST_READONLY
+  // SHIFT_PUT_DOESNT_THROW_FIRST_READONLY
+  // SHIFT_PUT_IGNORES_FIRST_NON_WRITABLE
+  // SHIFT_PUT_DOESNT_THROW_FIRST_NON_WRITABLE
+  // SHIFT_PUT_IGNORES_LAST_READONLY
+  // SHIFT_PUT_DOESNT_THROW_LAST_READONLY
+  arrayPutProblem(supportedProblems,
+                  'shift', [], 0, 'b', 'readonly',
+                  repair_SHIFT_IGNORES_READONLY);
+  arrayPutProblem(supportedProblems,
+                  'shift', [], 0, 'b', 'non_writable',
+                  repair_SHIFT_IGNORES_READONLY);
+  arrayPutProblem(supportedProblems,
+                  'shift', [], 1, void 0, 'readonly',
+                  repair_SHIFT_IGNORES_READONLY);
+
+  // REVERSE_PUT_IGNORES_FIRST_READONLY
+  // REVERSE_PUT_DOESNT_THROW_FIRST_READONLY
+  // REVERSE_PUT_IGNORES_FIRST_NON_WRITABLE
+  // REVERSE_PUT_DOESNT_THROW_FIRST_NON_WRITABLE
+  // REVERSE_PUT_IGNORES_LAST_READONLY
+  // REVERSE_PUT_DOESNT_THROW_LAST_READONLY
+  // REVERSE_PUT_IGNORES_LAST_NON_WRITABLE
+  // REVERSE_PUT_DOESNT_THROW_LAST_NON_WRITABLE
+  arrayPutProblem(supportedProblems,
+                  'reverse', [], 0, 'b', 'readonly');
+  arrayPutProblem(supportedProblems,
+                  'reverse', [], 0, 'b', 'non_writable');
+  arrayPutProblem(supportedProblems,
+                  'reverse', [], 1, 'c', 'readonly');
+  arrayPutProblem(supportedProblems,
+                  'reverse', [], 1,  'c', 'non_writable');
+
+  // SORT_PUT_IGNORES_FIRST_READONLY
+  // SORT_PUT_DOESNT_THROW_FIRST_READONLY
+  // SORT_PUT_IGNORES_FIRST_NON_WRITABLE
+  // SORT_PUT_DOESNT_THROW_FIRST_NON_WRITABLE
+  // SORT_PUT_IGNORES_LAST_READONLY
+  // SORT_PUT_DOESNT_THROW_LAST_READONLY
+  // SORT_PUT_IGNORES_LAST_NON_WRITABLE
+  // SORT_PUT_DOESNT_THROW_LAST_NON_WRITABLE
+  arrayPutProblem(supportedProblems,
+                  'sort', [], 0, 'b', 'readonly');
+  arrayPutProblem(supportedProblems,
+                  'sort', [], 0, 'b', 'non_writable');
+  arrayPutProblem(supportedProblems,
+                  'sort', [], 1, 'c', 'readonly');
+  arrayPutProblem(supportedProblems,
+                  'sort', [], 1,  'c', 'non_writable');
 
   // UNSHIFT_IGNORES_SEALED
   // UNSHIFT_IGNORES_FROZEN
@@ -5436,11 +7031,11 @@ var ses;
   // SPLICE_IGNORES_FROZEN
   // SHIFT_IGNORES_SEALED
   // SHIFT_IGNORES_FROZEN
-  arrayMutatorProblem(supportedProblems, 'unshift', ['foo']);
-  arrayMutatorProblem(supportedProblems, 'splice', [0, 0, 'foo']);
-  arrayMutatorProblem(supportedProblems, 'shift', []);
+  arraySealProblem(supportedProblems, 'unshift', ['foo']);
+  arraySealProblem(supportedProblems, 'splice', [0, 0, 'foo']);
+  arraySealProblem(supportedProblems, 'shift', []);
   // Array.prototype.{push,pop,sort} are also subject to the problem
-  // arrayMutatorProblem handles, but are handled separately and more
+  // arraySealProblem handles, but are handled separately and more
   // precisely.
 
   // Note: GLOBAL_LEAKS_FROM_ARRAY_METHODS should be LAST in the list so as
@@ -5477,7 +7072,7 @@ var ses;
       strictForEachFn(supportedProblems, ses._repairer.registerProblem);
       ses._repairer.testAndRepair();
     }
-    
+
     var reports = ses._repairer.getReports();
 
     // Made available to allow for later code reusing our diagnoses to work
@@ -5495,7 +7090,7 @@ var ses;
     });
     ses.es5ProblemReports = indexedReports;
   } catch (err) {
-    ses._repairer.updateMaxSeverity(ses.severities.NOT_SUPPORTED);
+    ses._repairer.updateMaxSeverity(severities.NOT_SUPPORTED);
     var during = ses._repairer.wasDoing();
     logger.error('ES5 Repair ' + during + 'failed with: ', err);
   }
@@ -5746,7 +7341,7 @@ var WeakMap;
     },
     preSeverity: severities.UNSAFE_SPEC_VIOLATION,
     canRepair: true,
-    urls: [],  // TODO(kpreid): File/find bug with IE 11
+    urls: ['https://connect.microsoft.com/IE/feedback/details/871401/weakmaps-drop-frozen-keys'],
     sections: [],  // TODO(kpreid): cite ES6 when published
     tests: []  // TODO(kpreid): should be in test262
   });
@@ -5825,6 +7420,17 @@ var WeakMap;
           name.substr(0, HIDDEN_NAME_PREFIX.length) == HIDDEN_NAME_PREFIX &&
           name.substr(name.length - 3) === '___');
     }
+
+    // For all calls to Object.defineProperty (defProp) to redefine an
+    // existing property, keep in mind that omitting some attributes,
+    // like writable:, enumerable:, or configurable:, means that the
+    // current setting of these attributes should be preseved, rather
+    // than defaulting to false.
+
+    // Note that the use of .filter as an array instance method below
+    // only works in SES under the immutable primordials
+    // assumption. For example, it would not work in CES (Confined
+    // EcmaScript).
 
     /**
      * Monkey patch getOwnPropertyNames to avoid revealing the
@@ -6397,6 +8003,7 @@ var ses;
         * http://code.google.com/p/causeway/source/browse/trunk/src/js/com/teleometry/causeway/purchase_example/workers/makeCausewayLogger.js
         */
        function getCWStack(err) {
+         if (Object(err) !== err) { return void 0; }
          var sst = ssts.get(err);
          if (sst === void 0 && err instanceof Error) {
            // We hope it triggers prepareStackTrace
@@ -6417,49 +8024,127 @@ var ses;
        ses.getCWStack = getCWStack;
      })();
 
-   } else if (global.opera) {
+   } else {
      (function() {
-       // Since pre-ES5 browsers are disqualified, we can assume a
-       // minimum of Opera 11.60.
-     })();
+       // Each of these patterns should have the first capture group
+       // be the function name, and the second capture group be the
+       // source URL together with position information. Afterwards,
+       // the lineColPattern will pull apart these source position
+       // components. On all, we assume the function name, if any, has
+       // no colon (":"), at-sign ("@"), or open paren ("("), as each
+       // of these are used to recognize other parts of a debug line.
 
+       // Seen on FF: The function name is sometimes followed by
+       // argument descriptions enclosed in parens, which we
+       // ignore. Then there is always an at-sign followed by possibly
+       // empty source position.
+       var FFFramePattern =  /^\s*([^:@(]*?)\s*(?:\(.*\))?@(.*?)$/;
+       // Seen on IE: The line begins with " at ", as on v8, which we
+       // ignore. Then the function name, then the source position
+       // enclosed in parens.
+       var IEFramePattern =  /^\s*(?:at\s+)?([^:@(]*?)\s*\((.*?)\)$/;
+       // Seem on Safari (JSC): The name optionally followed by an
+       // at-sign and source position information. This is like FF,
+       // except that the at-sign and source position info may
+       // together be absent.
+       var JSCFramePatt1 =   /^\s*([^:@(]*?)\s*(?:@(.*?))?$/;
+       // Also seen on Safari (JSC): Just the source position info by
+       // itself, with no preceding function name. The source position
+       // always seems to contain at least a colon, which is how we
+       // decide that it is a source position rather than a function
+       // name. The pattern here is a bit more flexible, in that it
+       // will accept a function name preceding the source position
+       // and separated by whitespace.
+       var JSCFramePatt2 =   /^\s*?([^:@(]*?)\s*?(.*?)$/;
 
-   } else if (new Error().stack) {
-     (function() {
-       var FFFramePattern = (/^([^@]*)@(.*?):?(\d*)$/);
+       // List the above patterns in priority order, where the first
+       // matching pattern is the one used for any one stack line.
+       var framePatterns = [FFFramePattern, IEFramePattern,
+                            JSCFramePatt1, JSCFramePatt2];
 
-       // stacktracejs.com suggests that this indicates FF. Really?
+       // Each of the LineColPatters should have the first capture
+       // group be the source URL if any, the second by the line
+       // number if any, and the third be the column number if any.
+
+       // Seen on FF Nightly 30 for execution in evaled strings
+       var FFEvalLineColPatterns = (/^(?:.*?) line \d+ > eval():(\d+):(\d+)$/);
+       // If the source position ends in either one or two
+       // colon-digit-sequence suffixes, then the first of these are
+       // the line number, and the second, if present, is the column
+       // number.
+       var MainLineColPattern = /^(.*?)(?::(\d+)(?::(\d+))?)?$/;
+
+       // List the above patterns in priority order, where the first
+       // matching pattern is the one used for any one stack line.
+       var lineColPatterns = [FFEvalLineColPatterns, MainLineColPattern];
+
        function getCWStack(err) {
+         if (!(err instanceof Error)) { return void 0; }
          var stack = err.stack;
          if (!stack) { return void 0; }
          var lines = stack.split('\n');
+         if (/^\w*Error:/.test(lines[0])) {
+           lines = lines.slice(1);
+         }
          var frames = lines.map(function(line) {
-           var match = FFFramePattern.exec(line);
-           if (match) {
-             return {
-               name: match[1].trim() || '?',
-               source: match[2].trim() || '?',
-               span: [[+match[3]]]
-             };
-           } else {
-             return {
-               name: line.trim() || '?',
-               source: '?',
-               span: []
-             };
+           var name = line.trim();
+           var source = '?';
+           var span = [];
+           // Using .some here only because it gives us a way to escape
+           // the loop early. We do not use the results of the .some.
+           framePatterns.some(function(framePattern) {
+             var match = framePattern.exec(line);
+             if (match) {
+               name = match[1] || '?';
+               source = match[2] || '?';
+               // Using .some here only because it gives us a way to escape
+               // the loop early. We do not use the results of the .some.
+               lineColPatterns.some(function(lineColPattern) {
+                 var sub = lineColPattern.exec(source);
+                 if (sub) {
+                   // sub[1] if present is the source URL.
+                   // sub[2] if present is the line number.
+                   // sub[3] if present is the column number.
+                   source = sub[1] || '?';
+                   if (sub[2]) {
+                     if (sub[3]) {
+                       span = [[+sub[2], +sub[3]]];
+                     } else {
+                       span = [[+sub[2]]];
+                     }
+                   }
+                   return true;
+                 }
+                 return false;
+               });
+               return true;
+             }
+             return false;
+           });
+           if (name === 'Anonymous function') {
+             // Adjust for weirdness seen on IE
+             name = '?';
+           } else if (name.indexOf('/') !== -1) {
+             // Adjust for function name weirdness seen on FF.
+             name = name.replace(/[/<]/g,'');
+             var parts = name.split('/');
+             name = parts[parts.length -1];
            }
+           if (source === 'Unknown script code' || source === 'eval code') {
+             // Adjust for weirdness seen on IE
+             source = '?';
+           }
+           return {
+             name: name,
+             source: source,
+             span: span
+           };
          });
          return { calls: frames };
        }
 
        ses.getCWStack = getCWStack;
      })();
-
-   } else {
-     (function() {
-       // Including Safari and IE10.
-     })();
-
    }
 
    /**
@@ -6489,9 +8174,21 @@ var ses;
    function getStack(err) {
      if (err !== Object(err)) { return void 0; }
      var cwStack = ses.getCWStack(err);
-     if (!cwStack) { return void 0; }
-     var result = ses.stackString(cwStack);
-     if (err instanceof Error) { result = err + '\n' + result; }
+     var result;
+     if (cwStack) {
+       result = ses.stackString(cwStack);
+     } else {
+       if (err instanceof Error &&
+           'stack' in err &&
+           typeof (result = err.stack) === 'string') {
+         // already in result
+       } else {
+         return void 0;
+       }
+     }
+     if (err instanceof Error) {
+       result = err + '\n' + result;
+     }
      return result;
    };
    ses.getStack = getStack;
@@ -6644,9 +8341,15 @@ var ses;
  *     of these is tamed as if with true, so that the value of the
  *     property is further tamed according to what other objects it
  *     inherits from.
+ * <li>false, which suppression permission inherited via "*".
  * </ul>
  *
- * The members of the whitelist are either
+ * <p>TODO: We want to do for constructor: something weaker than '*',
+ * but rather more like what we do for [[Prototype]] links, which is
+ * that it is whitelisted only if it points as an object which is
+ * otherwise reachable by a whitelisted path.
+ *
+ * <p>The members of the whitelist are either
  * <ul>
  * <li>(uncommented) defined by the ES5.1 normative standard text,
  * <li>(questionable) provides a source of non-determinism, in
@@ -6680,11 +8383,71 @@ var ses;
 
   var t = true;
   var TypedArrayWhitelist;  // defined and used below
+
+  // Note that, on browsers suffering from
+  // CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT, startSES does an
+  // imperative update of the whitelist, but should be ok.  Please
+  // maintain this note together with corresponding notes in
+  // startSES.js where whitelist is updated and where it first read.
   ses.whitelist = {
     cajaVM: {                        // Caja support
-      // This object is present here only to make it itself processed by the
-      // whitelist, not to make it accessible by this path.
-      '[[ThrowTypeError]]': t,
+      // The accessible intrinsics which are not reachable by own
+      // property name traversal are listed here so that they are
+      // processed by the whitelist, although this also makes them
+      // accessible by this path.  See
+      // https://people.mozilla.org/~jorendorff/es6-draft.html#sec-well-known-intrinsic-objects
+      // Of these, ThrowTypeError is the only one from ES5. All the
+      // rest were introduced in ES6.
+      anonIntrinsics: {
+        ThrowTypeError: {},
+        IteratorPrototype: {
+          constructor: false  // suppress inherited '*'
+          // Note that startSES may add a "next: '*'" here, depending on
+          // CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT
+        },
+        ArrayIteratorPrototype: {},
+        StringIteratorPrototype: {},
+        // TODO MapIteratorPrototype: {},
+        // TODO SetIteratorPrototype: {},
+
+        // The %GeneratorFunction% intrinsic is the constructor of
+        // generator functions, so %GeneratorFunction%.prototype is
+        // the %Generator% intrinsic, which all generator functions
+        // inherit from. A generator function is effectively the
+        // constructor of its generator instances, so, for each
+        // generator function (e.g., "g1" on the diagram at
+        // http://people.mozilla.org/~jorendorff/figure-2.png )
+        // its .prototype is a prototype that its instances inherit
+        // from. Paralleling this structure, %Generator%.prototype,
+        // i.e., %GeneratorFunction%.prototype.prototype, is the
+        // object that all these generator function prototypes inherit
+        // from. The .next, .return and .throw that generator
+        // instances respond to are actually the builtin methods they
+        // inherit from this object.
+        GeneratorFunction: {
+          prototype: {
+            prototype: {
+              next: '*',
+              'return': '*',
+              'throw': '*'
+            }
+          }
+        },
+        TypedArray: TypedArrayWhitelist = {
+          length: '*',  // does not inherit from Function.prototype on Chrome
+          name: '*',  // ditto
+          BYTES_PER_ELEMENT: '*',
+          prototype: {
+            buffer: 'maybeAccessor',
+            byteOffset: 'maybeAccessor',
+            byteLength: 'maybeAccessor',
+            length: 'maybeAccessor',
+            BYTES_PER_ELEMENT: '*',
+            set: '*',
+            subarray: '*'
+          }
+        }
+      },
 
       log: t,
       tamperProof: t,
@@ -6741,6 +8504,14 @@ var ses;
 // could be used to trap and thereby discover HIDDEN_NAME. So until we
 // (TODO(erights)) write the needed monkey patching of proxies, we
 // omit them from our whitelist.
+//
+// We now have an additional reason to omit Proxy from the whitelist.
+// The makeBrandTester in repairES5 uses Allen's trick at
+// https://esdiscuss.org/topic/tostringtag-spoofing-for-null-and-undefined#content-59
+// , but testing reveals that, on FF 35.0.1, a proxy on an exotic
+// object X will pass this brand test when X will. This is fixed as of
+// FF Nightly 38.0a1.
+//
 //    Proxy: {                         // ES-Harmony proposal
 //      create: t,
 //      createFunction: t
@@ -6767,6 +8538,17 @@ var ses;
         __defineSetter__: t,
         __lookupGetter__: t,
         __lookupSetter__: t,
+
+        // There are only here to support repair_THROWING_THAWS_FROZEN_OBJECT,
+        // which repairs Safari-only bug
+        // https://bugs.webkit.org/show_bug.cgi?id=141878 by
+        // preemptively adding these properties to any objects that
+        // are about to become non-extensible. When these are already
+        // present, then the Safari bug does not add them.
+        line: '*',
+        column: '*',
+        sourceUrl: '*',
+        stack: '*',
 
         constructor: '*',
         toString: '*',
@@ -7020,6 +8802,10 @@ var ses;
       parse: t,
       stringify: t
     },
+
+
+    ///////////////// Standard Starting in ES6 //////////////////
+
     ArrayBuffer: {                   // Khronos Typed Arrays spec; ops are safe
       length: t,  // does not inherit from Function.prototype on Chrome
       name: t,  // ditto
@@ -7029,20 +8815,7 @@ var ses;
         slice: t
       }
     },
-    Int8Array: TypedArrayWhitelist = {  // Typed Arrays spec
-      length: t,  // does not inherit from Function.prototype on Chrome
-      name: t,  // ditto
-      BYTES_PER_ELEMENT: t,
-      prototype: {
-        buffer: 'maybeAccessor',
-        byteOffset: 'maybeAccessor',
-        byteLength: 'maybeAccessor',
-        length: 'maybeAccessor',
-        BYTES_PER_ELEMENT: t,
-        set: t,
-        subarray: t
-      }
-    },
+    Int8Array: TypedArrayWhitelist,
     Uint8Array: TypedArrayWhitelist,
     Uint8ClampedArray: TypedArrayWhitelist,
     Int16Array: TypedArrayWhitelist,
@@ -7263,10 +9036,13 @@ var ses;
  * WeakMap spec. Compatible with ES5-strict or anticipated ES6.
  *
  * //requires ses.makeCallerHarmless, ses.makeArgumentsHarmless
+ * //requires ses.noFuncPoison
  * //requires ses.verifyStrictFunctionBody
+ * //requires ses.getUndeniables, ses.earlyUndeniables
+ * //requires ses.getAnonIntrinsics
  * //optionally requires ses.mitigateSrcGotchas
  * //provides ses.startSES ses.resolveOptions, ses.securableWrapperSrc
- * //provides ses.makeCompiledExpr
+ * //provides ses.makeCompiledExpr ses.prepareExpr
  *
  * @author Mark S. Miller,
  * @author Jasvir Nagra
@@ -7408,21 +9184,21 @@ var cajaVM;
  *        TODO(erights): Currently, the code has only been tested when
  *        {@code global} is the global object of <i>this</i>
  *        frame. The code should be made to work for cross-frame use.
- * @param whitelist ::Record(Permit) where Permit = true | "*" |
- *        Record(Permit).  Describes the subset of naming
- *        paths starting from {@code sharedImports} that should be
- *        accessible. The <i>accessible primordials</i> are all values
- *        found by navigating these paths starting from {@code
- *        sharedImports}. All non-whitelisted properties of accessible
- *        primordials are deleted, and then {@code sharedImports}
- *        and all accessible primordials are frozen with the
- *        whitelisted properties frozen as data properties.
- *        TODO(erights): fix the code and documentation to also
- *        support confined-ES5, suitable for confining potentially
- *        offensive code but not supporting defensive code, where we
- *        skip this last freezing step. With confined-ES5, each frame
- *        is considered a separate protection domain rather that each
- *        individual object.
+ * @param whitelist ::Record(Permit) where
+ *        Permit = true | false | "*" | "maybeAccessor" | Record(Permit).
+ *        Describes the subset of naming paths starting from {@code
+ *        sharedImports} that should be accessible. The <i>accessible
+ *        primordials</i> are all values found by navigating these
+ *        paths starting from {@code sharedImports}. All
+ *        non-whitelisted properties of accessible primordials are
+ *        deleted, and then {@code sharedImports} and all accessible
+ *        primordials are frozen with the whitelisted properties
+ *        frozen as data properties.  TODO(erights): fix the code and
+ *        documentation to also support confined-ES5, suitable for
+ *        confining potentially offensive code but not supporting
+ *        defensive code, where we skip this last freezing step. With
+ *        confined-ES5, each frame is considered a separate protection
+ *        domain rather that each individual object.
  * @param limitSrcCharset ::F([string])
  *        Given the sourceText for a strict Program, return a record with an
  *        'error' field if it is not in the limited character set that SES
@@ -7499,6 +9275,17 @@ ses.startSES = function(global,
       ses.es5ProblemReports.NONCONFIGURABLE_OWN_PROTO.afterFailure;
   var INCREMENT_IGNORES_FROZEN =
       ses.es5ProblemReports.INCREMENT_IGNORES_FROZEN.afterFailure;
+  var CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT =
+      ses.es5ProblemReports.CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT.
+            afterFailure;
+
+  if (CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT) {
+    // Note: Imperative update, but should be ok.  Please maintain
+    // this note together with corresponding notes where whitelist is
+    // defined in whitelist.js, and where it is first read below.
+    whitelist.cajaVM.anonIntrinsics.IteratorPrototype.next = '*';
+    // Whether this has the desired effect is tested after cleaning.
+  }
 
   var dirty = true;
 
@@ -7531,18 +9318,10 @@ ses.startSES = function(global,
    * mitigate. Passing no {@code opt_mitigateOpts} performs all the
    * default mitigations. Returns a well behaved options record.
    *
-   * <p>See {@code compileExpr} for documentation of the mitigation
+   * <p>See {@code prepareExpr} for documentation of the mitigation
    * options and their effects.
    */
   function resolveOptions(opt_mitigateOpts) {
-    if (typeof opt_mitigateOpts === 'string') {
-      // TODO: transient deprecated adaptor only, since there used to
-      // be an opt_sourceUrl parameter in many of the parameter
-      // positions now accepting an opt_mitigateOpts. Once we are
-      // confident that we no longer have live clients that count on
-      // the  old behavior, remove this kludge.
-      opt_mitigateOpts = { sourceUrl: opt_mitigateOpts };
-    }
     function resolve(opt, defaultOption) {
       return (opt_mitigateOpts && opt in opt_mitigateOpts) ?
         opt_mitigateOpts[opt] : defaultOption;
@@ -7583,7 +9362,7 @@ ses.startSES = function(global,
    * {@code options} are assumed to already be canonicalized by {@code
    * resolveOptions} and says which mitigations to apply.
    */
-  function mitigateSrcGotchas(funcBodySrc, options) {
+  function mitigateIfPossible(funcBodySrc, options) {
     var safeError;
     if ('function' === typeof ses.mitigateSrcGotchas) {
       if (INCREMENT_IGNORES_FROZEN) {
@@ -7618,14 +9397,6 @@ ses.startSES = function(global,
     func.prototype = null;
     return freeze(func);
   }
-
-  /**
-   * Obtain the ES5 singleton [[ThrowTypeError]].
-   */
-  function getThrowTypeError() {
-    return gopd(getThrowTypeError, "arguments").get;
-  }
-
 
   function fail(str) {
     debugger;
@@ -8000,6 +9771,19 @@ ses.startSES = function(global,
     }
     ses.securableWrapperSrc = securableWrapperSrc;
 
+    /**
+     * See <a href="http://www.ecma-international.org/ecma-262/5.1/#sec-7.3"
+     * >EcmaScript 5 Line Terminators</a>
+     */
+    var hasLineTerminator = /[\u000A\u000D\u2028\u2029]/;
+
+    function verifyOnOneLine(text) {
+      text = ''+text;
+      if (hasLineTerminator.test(text)) {
+        throw new TypeError("Unexpected line terminator: " + text);
+      }
+      return text;
+    }
 
     /**
      * Given a wrapper function, such as the result of evaluating the
@@ -8024,6 +9808,10 @@ ses.startSES = function(global,
     }
     ses.makeCompiledExpr = makeCompiledExpr;
 
+    // Maintain the list of mitigation options documented below in
+    // coordination with the list of mitigation options in
+    // html-emitter.js's evaluateUntrustedExternalScript.
+    // See https://code.google.com/p/google-caja/issues/detail?id=1893
     /**
      * Compiles {@code exprSrc} as a strict expression into a function
      * of an {@code imports}, that when called evaluates {@code
@@ -8076,13 +9864,13 @@ ses.startSES = function(global,
      * {@code with} together with RegExp matching to intercept free
      * variable access without parsing.
      */
-    function compileExpr(exprSrc, opt_mitigateOpts) {
+    function prepareExpr(exprSrc, opt_mitigateOpts) {
       // Force exprSrc to be a string that can only parse (if at all) as
       // an expression.
       exprSrc = '(' + exprSrc + '\n)';
 
       var options = resolveOptions(opt_mitigateOpts);
-      exprSrc = mitigateSrcGotchas(exprSrc, options);
+      exprSrc = mitigateIfPossible(exprSrc, options);
 
       // This is a workaround for a bug in the escodegen renderer that
       // renders expressions as expression statements
@@ -8090,9 +9878,51 @@ ses.startSES = function(global,
         exprSrc = exprSrc.substr(0, exprSrc.length - 1);
       }
       var wrapperSrc = securableWrapperSrc(exprSrc);
-      var wrapper = unsafeEval(wrapperSrc);
       var freeNames = atLeastFreeVarNames(exprSrc);
-      var result = makeCompiledExpr(wrapper, freeNames, options);
+
+      var suffixSrc;
+      var sourceUrl = options.sourceUrl;
+      if (sourceUrl) {
+        sourceUrl = verifyOnOneLine(sourceUrl);
+        // Placing the sourceURL inside a line comment at the end of
+        // the evaled string, in this format, has emerged as a de
+        // facto convention for associating the source info with this
+        // evaluation. See
+        // http://updates.html5rocks.com/2013/06/sourceMappingURL-and-sourceURL-syntax-changed
+        // http://www.html5rocks.com/en/tutorials/developertools/sourcemaps/#toc-sourceurl
+        // https://developers.google.com/chrome-developer-tools/docs/javascript-debugging#breakpoints-dynamic-javascript
+
+        // TODO(erights): Should validate that the sourceURL is a
+        // valid URL of a whitelisted protocol, where that whitelist
+        // does not include "javascript:". Not doing so at this time
+        // does not itself introduce a security vulnerability, as long
+        // as the sourceURL is all on one line, since the text only
+        // appears in a JavaScript line comment. Separate hazards may
+        // appear when the alleged URL reappears in a stack trace, but
+        // it is the responsibility of that code to handle those URLs
+        // safely.
+        suffixSrc = '\n//# sourceURL=' + sourceUrl + '\n';
+      } else {
+        suffixSrc = '';
+      }
+
+      return def({
+        options: options,
+        wrapperSrc: wrapperSrc,
+        suffixSrc: suffixSrc,
+        freeNames: freeNames
+      });
+    }
+    ses.prepareExpr = prepareExpr;
+
+    /**
+     *
+     */
+    function compileExpr(exprSrc, opt_mitigateOpts) {
+      var prep = prepareExpr(exprSrc, opt_mitigateOpts);
+
+      var wrapper = unsafeEval(prep.wrapperSrc + prep.suffixSrc);
+      var result = makeCompiledExpr(wrapper, prep.freeNames, prep.options);
       return freeze(result);
     }
 
@@ -8160,7 +9990,7 @@ ses.startSES = function(global,
      * any valid Program.
      *
      * For documentation on {@code opt_mitigateOpts} see the
-     * corresponding parameter in compileExpr.
+     * corresponding parameter in {@code prepareExpr}.
      *
      * <p>In addition, in case the module source happens to begin with
      * a streotyped prelude of the CommonJS module system, the
@@ -8195,7 +10025,7 @@ ses.startSES = function(global,
       // modSrc from eliding the rest of the wrapper.
       var exprSrc =
           '(function() {' +
-          mitigateSrcGotchas(modSrc, options) +
+          mitigateIfPossible(modSrc, options) +
           '\n}).call(this)';
       // Follow the pattern in compileExpr
       var wrapperSrc = securableWrapperSrc(exprSrc);
@@ -8207,32 +10037,97 @@ ses.startSES = function(global,
       return freeze(moduleMaker);
     }
 
-    /**
-     * A safe form of the {@code Function} constructor, which
-     * constructs strict functions that can only refer freely to the
-     * {@code sharedImports}.
-     *
-     * <p>The returned function is strict whether or not it declares
-     * itself to be.
-     */
-    function FakeFunction(var_args) {
-      var params = [].slice.call(arguments, 0);
-      var body = ses.verifyStrictFunctionBody(params.pop() || '');
+    // This block replaces the original Function constructor, and the
+    // original %GeneratorFunction% instrinsic if present, with safe
+    // replacements that preserve SES confinement. After this block is
+    // done, the originals should no longer be reachable.
+    (function() {
+      var unsafeIntrinsics = ses.getAnonIntrinsics();
 
-      // Although the individual params may not be strings, the params
-      // array is reliably a fresh array, so under the SES (not CES)
-      // assumptions of unmodified primordials, this calls the reliable
-      // Array.prototype.join which guarantees that its result is a string.
-      params = params.join(',');
+      /**
+       * A safe form of the {@code Function} constructor, which
+       * constructs strict functions that can only refer freely to the
+       * {@code sharedImports}.
+       *
+       * <p>The returned function is strict whether or not it declares
+       * itself to be.
+       */
+      function FakeFunction(var_args) {
+        var params = [].slice.call(arguments, 0);
+        var body = ses.verifyStrictFunctionBody(params.pop() || '');
 
-      // Note the EOL after body to prevent a trailing line comment in
-      // body from eliding the rest of the wrapper.
-      var exprSrc = '(function(' + params + '\n){' + body + '\n})';
-      return compileExpr(exprSrc)(sharedImports);
-    }
-    FakeFunction.prototype = UnsafeFunction.prototype;
-    FakeFunction.prototype.constructor = FakeFunction;
-    global.Function = FakeFunction;
+        // Although the individual params may not be strings, the params
+        // array is reliably a fresh array, so under the SES (not CES)
+        // assumptions of unmodified primordials, this calls the reliable
+        // Array.prototype.join which guarantees that its result is a string.
+        params = params.join(',');
+
+        // Note the EOL after body to prevent a trailing line comment in
+        // body from eliding the rest of the wrapper.
+        var exprSrc = '(function(' + params + '\n){' + body + '\n})';
+        return compileExpr(exprSrc)(sharedImports);
+      }
+      FakeFunction.prototype = UnsafeFunction.prototype;
+      FakeFunction.prototype.constructor = FakeFunction;
+      global.Function = FakeFunction;
+
+
+      function FakeGeneratorFunction(var_args) {
+        var params = [].slice.call(arguments, 0);
+        var body = ses.verifyStrictFunctionBody(params.pop() || '');
+        params = params.join(',');
+
+        var exprSrc = '(function*(' + params + '\n){' + body + '\n})';
+        return compileExpr(exprSrc)(sharedImports);
+      }
+      var UnsafeGeneratorFunction = unsafeIntrinsics.GeneratorFunction;
+      if (UnsafeGeneratorFunction) {
+        var Generator = ses.earlyUndeniables['%Generator%'];
+        if (!(Generator &&
+              Generator.constructor === UnsafeGeneratorFunction &&
+              UnsafeGeneratorFunction.prototype === Generator &&
+              getProto(UnsafeGeneratorFunction) === UnsafeFunction &&
+              getProto(Generator) === Function.prototype)) {
+          throw new Error('Unexpected primordial Generator arrangement');
+        }
+        FakeGeneratorFunction.prototype = Generator;
+        FakeGeneratorFunction.__proto__ = FakeFunction;
+        if (getProto(FakeGeneratorFunction) !== FakeFunction) {
+          throw Error('Failed to set FakeGeneratorFunction.__proto__');
+        }
+        try {
+          // According to section 25.2.3.1 of the ES6 / ES2015 spec,
+          // the generator.constructor property should have attributes
+          // writable: false, configurable: true, so we need to change
+          // it with defProp rather than assignment. Recall that when
+          // defProp-ing an existing property, all unspecified
+          // attributes preserve their existing setting.
+          defProp(Generator, 'constructor', { value: FakeGeneratorFunction });
+        } catch (ex) {
+          try {
+            Generator.constructor = FakeGeneratorFunction;
+          } catch (ex2) {
+            // TODO: report
+          }
+          // TODO: report
+        }
+        if (Generator.constructor !== FakeGeneratorFunction) {
+          // TODO: define logger and reportItem earlier, so we can use
+          // them here.
+          ses.updateMaxSeverity(ses.severities.NOT_ISOLATED);
+          if (Generator.constructor === UnsafeGeneratorFunction) {
+            ses.logger.error(
+                'Cannot deny access to unsafe %GeneratorFunction%');
+          } else {
+            throw new Error('Unexpected %Generator%.constructor: ' +
+                            Generator.constructor);
+          }
+        }
+      }
+      // The next time we ses.getAnonIntrinsics(), the result should be
+      // safe intrinsics.
+    }());
+
 
     /**
      * A safe form of the indirect {@code eval} function, which
@@ -8334,7 +10229,12 @@ ses.startSES = function(global,
       }
       constFunc(lengthGetter);
 
-      var nativeProxies = global.Proxy && (function () {
+      // test for old-style proxies, not ES6 direct proxies
+      // TODO(kpreid): Need to migrate to ES6-planned proxy API
+      var proxiesAvailable = global.Proxy !== undefined &&
+          !!global.Proxy.create;
+
+      var nativeProxies = proxiesAvailable && (function () {
         var obj = {0: 'hi'};
         var p = global.Proxy.create({
           get: function(O, P) {
@@ -8521,6 +10421,7 @@ ses.startSES = function(global,
       }
     })();
 
+
     global.cajaVM = { // don't freeze here
       // Note that properties defined on cajaVM must also be added to
       // whitelist.js, or they will be deleted.
@@ -8552,7 +10453,7 @@ ses.startSES = function(global,
       compileModule: constFunc(compileModule),
       // compileProgram: compileProgram, // Cannot be implemented in ES5.1.
       eval: fakeEval,               // don't freeze here
-      Function: FakeFunction,       // don't freeze here,
+      Function: global.Function,       // don't freeze here,
 
       sharedImports: sharedImports, // don't freeze here
       makeImports: constFunc(makeImports),
@@ -8565,12 +10466,22 @@ ses.startSES = function(global,
       //es5ProblemReports: ses.es5ProblemReports
     };
 
-    // Inserted here to make this ES5 singleton object controllable by our
-    // whitelist, not to make it part of our public API.
-    defProp(cajaVM, '[[ThrowTypeError]]', {
-      enumerable: false,
-      value: getThrowTypeError()
-    });
+    if (ses.es5ProblemReports.GENERATORFUNCTION_CANNOT_BE_DENIED.afterFailure) {
+      global.cajaVM.anonIntrinsics = {};
+    } else {
+      // Here we make available by name those intrinsics which would
+      // otherwise be accessible, but are not otherwise accessible by
+      // a naming path, starting from available roots, traversing
+      // through named own properties. See instrinsics in whitelist.js
+      // for a complete list of those intrinsics that might eventually
+      // show up here.
+      //
+      // The Object.freeze here ensures that if
+      // ses.getAnonIntrinsics() returns intrinsics not listed in
+      // the whitelist, then clean will fail rather than silently
+      // removing them.
+      global.cajaVM.anonIntrinsics = Object.freeze(ses.getAnonIntrinsics());
+    }
 
     var extensionsRecord = extensions();
     gopn(extensionsRecord).forEach(function (p) {
@@ -8620,6 +10531,12 @@ ses.startSES = function(global,
    * non-enumerable since ES5.1 specifies that all these properties
    * are non-enumerable on the global object.
    */
+  // Note that, on browsers suffering from
+  // CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT, startSES does an
+  // imperative update of the whitelist above, but should be ok.
+  // Please maintain this note together with corresponding notes in
+  // whitelist.js where whitelist is defined, and in startSES.js above
+  // where whitelist is updated
   keys(whitelist).forEach(function(name) {
     var desc = gopd(global, name);
     if (desc) {
@@ -8659,9 +10576,9 @@ ses.startSES = function(global,
    *
    * We initialize the whiteTable only so that {@code getPermit} can
    * process "*" inheritance using the whitelist, by walking actual
-   * superclass chains.
+   * inheritance chains.
    */
-  var whitelistSymbols = [true, '*', 'maybeAccessor'];
+  var whitelistSymbols = [true, false, '*', 'maybeAccessor'];
   var whiteTable = new WeakMap();
   function register(value, permit) {
     if (value !== Object(value)) { return; }
@@ -8671,8 +10588,7 @@ ses.startSES = function(global,
       }
       return;
     }
-    var oldPermit = whiteTable.get(value);
-    if (oldPermit) {
+    if (whiteTable.has(value)) {
       fail('primordial reachable through multiple paths');
     }
     whiteTable.set(value, permit);
@@ -8693,7 +10609,7 @@ ses.startSES = function(global,
    * {@code base} object, and if so, with what Permit?
    *
    * <p>If it should be permitted, return the Permit (where Permit =
-   * true | "accessor" | "*" | Record(Permit)), all of which are
+   * true | "maybeAccessor" | "*" | Record(Permit)), all of which are
    * truthy. If it should not be permitted, return false.
    */
   function getPermit(base, name) {
@@ -8727,7 +10643,7 @@ ses.startSES = function(global,
     }
     var diagnostic;
 
-    if (typeof base === 'function') {
+    if (typeof base === 'function' && !ses.noFuncPoison) {
       if (name === 'caller') {
         diagnostic = ses.makeCallerHarmless(base, path);
         // We can use a severity of SAFE here since if this isn't
@@ -8847,12 +10763,22 @@ ses.startSES = function(global,
   }
 
   /**
-   * Assumes all super objects are otherwise accessible and so will be
-   * independently cleaned.
+   * Removes all non-whitelisted properties found by recursively and
+   * reflectively walking own property chains.
+   *
+   * <p>Inherited properties are not checked, because we require that
+   * inherited-from objects are otherwise reachable by this traversal.
    */
   function clean(value, prefix) {
     if (value !== Object(value)) { return; }
     if (cleaning.get(value)) { return; }
+
+    var proto = getProto(value);
+    if (proto !== null && !whiteTable.has(proto)) {
+      reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
+                        'unexpected intrinsic', prefix + '.__proto__');
+    }
+
     cleaning.set(value, true);
     gopn(value).forEach(function(name) {
       var path = prefix + (prefix ? '.' : '') + name;
@@ -8899,33 +10825,41 @@ ses.startSES = function(global,
   // (identifying the actually frozen objects) if that doesn't cost too much.
   ses._primordialsHaveBeenFrozen = true;
 
-  // The following objects are ambiently available via language constructs, and
-  // therefore if we did not clean and defend them we have a problem. This is
-  // defense against mistakes in modifying the whitelist, not against browser
-  // bugs.
-  [
-    ['sharedImports', sharedImports],
-    ['[[ThrowTypeError]]', getThrowTypeError()],  // function literals
-    ['Array.prototype', Array.prototype],  // [], gOPN etc.
-    ['Boolean.prototype', Boolean.prototype],  // false, true
-    ['Function.prototype', Function.prototype],  // function(){}
-    ['Number.prototype', Number.prototype],  // 1, 2
-    ['Object.prototype', Object.prototype],  // {}, gOPD
-    ['RegExp.prototype', RegExp.prototype],  // /.../
-    ['String.prototype', String.prototype]  // "..."
-    // TODO(kpreid): Is this list complete?
-  ].forEach(function(record) {
-    var name = record[0];
-    var root = record[1];
-    if (!cleaning.has(root)) {
+  (function() {
+    // These objects are ambiently available via language
+    // constructs, and therefore if we did not clean and defend them
+    // we have a problem. This is defense against mistakes in
+    // modifying the whitelist, not against browser bugs.
+    var undeniables = ses.getUndeniables();
+
+    // This will catch if the result of cleaning somehow changed the
+    // result of gathering undeniables, which, because they are
+    // undeniable, should have been invariant across all those
+    // cleaning steps.
+    var undeniableNames = Object.keys(undeniables);
+    if (undeniableNames.length !== Object.keys(ses.earlyUndeniables).length) {
+      // By first ensuring that the number of undeniables is the same,
+      // the following test cannot names in earlyUndeniables that are
+      // absent from undeniables.
       reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
-          'Not cleaned', name);
+          'Number of undeniables changed');
     }
-    if (!Object.isFrozen(root)) {
-      reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
-          'Not frozen', name);
-    }
-  });
+    undeniableNames.forEach(function(name) {
+      var undeniable = undeniables[name];
+      if (undeniable !== ses.earlyUndeniables[name]) {
+        reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
+            'Undeniable "' + name + '" changed');
+      }
+      if (!cleaning.has(undeniable)) {
+        reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
+            'Not cleaned', name);
+      }
+      if (!Object.isFrozen(undeniable)) {
+        reportItemProblem(rootReports, ses.severities.NOT_ISOLATED,
+            'Not frozen', name);
+      }
+    });
+  }());
 
   logReports(propertyReports);
   logReports(rootReports);
@@ -8945,6 +10879,18 @@ ses.startSES = function(global,
         result + ')');
     ses.updateMaxSeverity(
         ses.es5ProblemReports.FREEZING_BREAKS_PROTOTYPES.preSeverity);
+  }
+
+  // Tests whether CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT is still a
+  // problem for us
+  if (ses._optForeignForIn) {
+    try {
+      ses._optForeignForIn({});
+    } catch (err) {
+      ses.logger.warn(
+          'CROSS_FRAME_FOR_IN_NEEDS_INHERITED_NEXT still problematic:', err);
+      // No severity update needed, since it fails safe.
+    }
   }
 
   ses.logger.reportMax();
@@ -9123,7 +11069,7 @@ var ses;
     ////////////////////////////////////////////////////////////////////////
 
     function makeSealerUnsealerPair() {
-      var boxValues = new WeakMap(true); // use key lifetime
+      var boxValues = new WeakMap();
 
       function seal(value) {
         var box = freeze({});
@@ -9153,7 +11099,7 @@ var ses;
     // Trademarks
     ////////////////////////////////////////////////////////////////////////
 
-    var stampers = new WeakMap(true);
+    var stampers = new WeakMap();
 
     /**
      * Internal routine for making a trademark from a table.
@@ -9524,7 +11470,7 @@ if (typeof window !== 'undefined') {
 ;
 /* Copyright Google Inc.
  * Licensed under the Apache Licence Version 2.0
- * Autogenerated at Wed Feb 26 17:25:09 PST 2014
+ * Autogenerated at Mon Feb 22 12:44:50 CET 2016
  * \@overrides window
  * \@provides cssSchema, CSS_PROP_BIT_QUANTITY, CSS_PROP_BIT_HASH_VALUE, CSS_PROP_BIT_NEGATIVE_QUANTITY, CSS_PROP_BIT_QSTRING, CSS_PROP_BIT_URL, CSS_PROP_BIT_UNRESERVED_WORD, CSS_PROP_BIT_UNICODE_RANGE, CSS_PROP_BIT_GLOBAL_NAME, CSS_PROP_BIT_PROPERTY_NAME */
 /**
@@ -10273,7 +12219,7 @@ if (typeof window !== 'undefined') {
 ;
 // Copyright Google Inc.
 // Licensed under the Apache Licence Version 2.0
-// Autogenerated at Wed Feb 26 17:25:10 PST 2014
+// Autogenerated at Mon Feb 22 12:44:50 CET 2016
 // @overrides window
 // @provides html4
 var html4 = {};
@@ -10333,6 +12279,7 @@ html4.ATTRIBS = {
   '*::onunload': 2,
   '*::spellcheck': 0,
   '*::style': 3,
+  '*::tabindex': 0,
   '*::title': 0,
   '*::translate': 0,
   'a::accesskey': 0,
@@ -10343,7 +12290,6 @@ html4.ATTRIBS = {
   'a::onblur': 2,
   'a::onfocus': 2,
   'a::shape': 0,
-  'a::tabindex': 0,
   'a::target': 10,
   'a::type': 0,
   'area::accesskey': 0,
@@ -10354,7 +12300,6 @@ html4.ATTRIBS = {
   'area::onblur': 2,
   'area::onfocus': 2,
   'area::shape': 0,
-  'area::tabindex': 0,
   'area::target': 10,
   'audio::controls': 0,
   'audio::loop': 0,
@@ -10370,7 +12315,6 @@ html4.ATTRIBS = {
   'button::name': 8,
   'button::onblur': 2,
   'button::onfocus': 2,
-  'button::tabindex': 0,
   'button::type': 0,
   'button::value': 0,
   'canvas::height': 0,
@@ -10462,13 +12406,13 @@ html4.ATTRIBS = {
   'input::onchange': 2,
   'input::onfocus': 2,
   'input::onselect': 2,
+  'input::pattern': 0,
   'input::placeholder': 0,
   'input::readonly': 0,
   'input::required': 0,
   'input::size': 0,
   'input::src': 1,
   'input::step': 0,
-  'input::tabindex': 0,
   'input::type': 0,
   'input::usemap': 11,
   'input::value': 0,
@@ -10518,7 +12462,6 @@ html4.ATTRIBS = {
   'select::onfocus': 2,
   'select::required': 0,
   'select::size': 0,
-  'select::tabindex': 0,
   'source::type': 0,
   'table::align': 0,
   'table::bgcolor': 0,
@@ -10561,7 +12504,6 @@ html4.ATTRIBS = {
   'textarea::readonly': 0,
   'textarea::required': 0,
   'textarea::rows': 0,
-  'textarea::tabindex': 0,
   'textarea::wrap': 0,
   'tfoot::align': 0,
   'tfoot::char': 0,
@@ -12513,7 +14455,7 @@ function HtmlEmitter(base, opt_mitigatingUrlRewriter, opt_domicile,
 
   function hasChild(el, name) {
     if (!el) { return false; }
-    
+
     for (var child = el.firstChild; child; child = child.nextSibling) {
       if (child.nodeType === 1 && virtTagName(child) === name) {
         return child;
@@ -12631,7 +14573,7 @@ function HtmlEmitter(base, opt_mitigatingUrlRewriter, opt_domicile,
             // a crypto hash
             var compiledModule = compileModule(scriptInnerText, opt_mitigate);
             try {
-              compiledModule(opt_domicile.window);
+              compiledModule(domicile.window);
 
               // Success.
               domicile.fireVirtualEvent(scriptNode, 'Event', 'load');
@@ -12650,23 +14592,21 @@ function HtmlEmitter(base, opt_mitigatingUrlRewriter, opt_domicile,
       // TODO(kpreid): Include error message appropriately
       domicile.fireVirtualEvent(scriptNode, 'Event', 'error');
 
-      // Dispatch to the onerror handler.
-      try {
-        // TODO(kpreid): This should probably become a full event dispatch.
-        // TODO: Should this happen inline or be dispatched out of band?
-        opt_domicile.window.onerror(
-            errorMessage,
-            // URL where error was raised.
-            // If this is an external load, then we need to use that URL,
-            // but for inline scripts we maintain the illusion by using the
-            // domicile.pseudoLocation.href which was passed here.
-            scriptBaseUri,
-            1  // Line number where error was raised.
-            // TODO: remap by inspection of the error if possible.
-            );
-      } catch (_) {
-        // Ignore problems dispatching error.
-      }
+      // TODO(kpreid): How should the virtual event on the node interact with
+      // this handling? Should they actually be the same event and cancel here?
+      //
+      // Note on window.Domado: We don't have a @requires dep here because we
+      // can run without Domado, but we know that Domado is loaded if we're in
+      // this code.
+      window.Domado.handleUncaughtException(
+          domicile.window,
+          // TODO(kpreid): should have an Error instance here, not a string.
+          errorMessage,
+          // URL where error was raised.
+          // If this is an external load, then we need to use that URL,
+          // but for inline scripts we maintain the illusion by using the
+          // domicile.pseudoLocation.href which was passed here.
+          scriptBaseUri);
 
       return errorMessage;
     }
@@ -12765,12 +14705,16 @@ function HtmlEmitter(base, opt_mitigatingUrlRewriter, opt_domicile,
       var proxiedUrl = getMitigatedUrl(url);
       var mitigateOpts;
       if (proxiedUrl) {
-        // Disable mitigation
+        // Disable mitigation.
+        // Maintain this list in coordination with the list of
+        // mitigation options documented in startSES.js.
+        // See https://code.google.com/p/google-caja/issues/detail?id=1893
         mitigateOpts = {
-          parseProgram : true,
-          rewriteTopLevelVars : false,
-          rewriteTopLevelFuncs : false,
-          rewriteTypeOf : false
+          parseFunctionBody: true,
+          rewriteTopLevelVars: false,
+          rewriteTopLevelFuncs: false,
+          rewriteFunctionCalls: false,
+          rewriteTypeOf: false
         };
         url = proxiedUrl;
       } else {
@@ -13794,9 +15738,18 @@ var decodeCss;
    *    delimiters and to not otherwise contain double quotes.
    */
   lexCss = function (cssText) {
-    cssText = '' + cssText;
-    var tokens = cssText.replace(/\r\n?/g, '\n')  // Normalize CRLF & CR to LF.
-        .match(CSS_TOKEN) || [];
+    // Stringify input. Additionally, insert and remove a non-latin1 character
+    // to force Firefox 33 to switch to a wide string representation, avoiding
+    // a performance bug. This workaround should become unnecessary after
+    // Firefox 34. https://bugzilla.mozilla.org/show_bug.cgi?id=1081175
+    // https://code.google.com/p/google-caja/issues/detail?id=1941
+    cssText = ('\uffff' + cssText).replace(/^\uffff/, '');
+
+    // // Normalize CRLF & CR to LF.
+    cssText = cssText.replace(/\r\n?/g, '\n');
+
+    // Tokenize.
+    var tokens = cssText.match(CSS_TOKEN) || [];
     var j = 0;
     var last = ' ';
     for (var i = 0, n = tokens.length; i < n; ++i) {
@@ -16812,7 +18765,10 @@ var Domado = (function() {
     }
   }
 
-  var proxiesAvailable = typeof Proxy !== 'undefined';
+  // test for old-style proxies, not ES6 direct proxies, because that's what we
+  // used and what ES5/3 provides.
+  // TODO(kpreid): Need to migrate to ES6-planned proxy API
+  var proxiesAvailable = typeof Proxy !== 'undefined' && !!Proxy.create;
   var proxiesInterceptNumeric = proxiesAvailable && (function() {
     var handler = {
       toString: function() { return 'proxiesInterceptNumeric test handler'; },
@@ -17620,7 +19576,8 @@ var Domado = (function() {
       taming,
       xmlHttpRequestMaker,
       naiveUriPolicy,
-      getBaseURL) {
+      getBaseURL,
+      onerrorTarget) {
     // See http://www.w3.org/TR/XMLHttpRequest/
 
     // TODO(ihab.awad): Improve implementation (interleaving, memory leaks)
@@ -17655,7 +19612,12 @@ var Domado = (function() {
           var self = this;
           privates.feral.onreadystatechange = function(event) {
             var evt = { target: self };
-            return handler.call(void 0, evt);
+            try {
+              return handler.call(void 0, evt);
+            } catch (e) {
+              Domado_.handleUncaughtException(
+                  onerrorTarget, e, '<XMLHttpRequest callback>');
+            }
           };
           // Store for later direct invocation if need be
           privates.handler = handler;
@@ -17985,14 +19947,14 @@ var Domado = (function() {
    * @return A record of functions attachDocument, dispatchEvent, and
    *     dispatchToHandler.
    */
-  return cajaVM.constFunc(function Domado_() {
+  function Domado_() {
     // Everything in this scope but not in function attachDocument() below
     // does not contain lexical references to a particular DOM instance, but
     // may have some kind of privileged access to Domado internals.
 
     // TODO(kpreid): This ID management should probably be handled by
     // ses-single-frame.js instead.
-    var importsToId = new WeakMap(true);
+    var importsToId = new WeakMap();
     var idToImports = [];
     var nextPluginId = 0;
     function getId(imports) {
@@ -18116,35 +20078,45 @@ var Domado = (function() {
       function tameSet(action, delayMillis) {
         // Existing browsers treat a timeout/interval of null or undefined as a
         // noop.
-        var id;
-        if (action) {
-          if (typeof action === 'function') {
-            // OK
-          } else if (evalStrings) {
-            // Note specific ordering: coercion to string occurs at time of
-            // call, syntax errors occur async.
-            var code = '' + action;
-            action = function callbackStringWrapper() {
-              cajaVM.compileModule(code)(environment);
-            };
-          } else {
-            // Early error for usability -- we also defend below.
-            // This check is not *necessary* for security.
-            throw new TypeError(
-                setName + ' called with a ' + typeof action + '.'
-                + '  Please pass a function instead of a string of JavaScript');
-          }
-          // actionWrapper defends against:
-          //   * Passing a string-like object which gets taken as code.
-          //   * Non-standard arguments to the callback.
-          //   * Non-standard effects of callback's return value.
-          var actionWrapper = passArg
-            ? function(time) { action(+time); }  // requestAnimationFrame
-            : function() { action(); };  // setTimeout, setInterval
-          id = set(actionWrapper, delayMillis | 0);
-        } else {
-          id = undefined;
+        if (!action) {
+          return undefined;
         }
+
+        // Convert action to a function.
+        if (typeof action === 'function') {
+          // OK
+        } else if (evalStrings) {
+          // Note specific ordering: coercion to string occurs at time of
+          // call, syntax errors occur async.
+          var code = '' + action;
+          action = function callbackStringWrapper() {
+            cajaVM.compileModule(code)(environment);
+          };
+        } else {
+          // Early error for usability -- we also defend below.
+          // This check is not *necessary* for security.
+          throw new TypeError(
+              setName + ' called with a ' + typeof action + '.'
+              + '  Please pass a function instead of a string of JavaScript');
+        }
+
+        // actionWrapper defends against:
+        //   * Passing a string-like object which gets taken as code.
+        //   * Non-standard arguments to the callback.
+        //   * Non-standard effects of callback's return value.
+        function actionWrapper(arg) {
+          try {
+            if (passArg) {
+              action(+arg);  // requestAnimationFrame
+            } else {
+              action();  // setTimeout, setInterval
+            }
+          } catch (e) {
+            Domado_.handleUncaughtException(
+                target, e, '<setName callback>');
+          }
+        }
+        var id = set(actionWrapper, delayMillis | 0);
         var tamed = {};
         ids.set(tamed, id);
         // Freezing is not *necessary*, but it makes testing/reasoning simpler
@@ -18825,7 +20797,8 @@ var Domado = (function() {
       var qsaVirtualization = cajaVM.def({
         containerClass: null,
         idSuffix: idSuffix,
-        tagPolicy: tagPolicy
+        tagPolicy: tagPolicy,
+        virtualizeAttrName: sanitizeOneAttr
       });
 
       /**
@@ -20218,7 +22191,7 @@ var Domado = (function() {
       }
       registerArrayLikeClass(TameDOMTokenList);
       Props.define(TameDOMTokenList.prototype, TokenListConf, {
-        length: PT.ro,
+        // length: PT.ro,  // handled by ArrayLike
         item: Props.ampMethod(function(privates, i) {
           var ftoken = privates.feral.item(i);
           return ftoken === null ? null : privates.getT(ftoken);
@@ -20308,14 +22281,8 @@ var Domado = (function() {
         try {
           Function.prototype.call.call(func, thisArg, tameEventObj);
         } catch (e) {
-          try {
-            tameWindow.onerror(
-                e.message,
-                '<' + tameEventObj.type + ' handler>',  // better than nothing
-                0);
-          } catch (e2) {
-            console.error('onerror handler failed\n', e, '\n', e2);
-          }
+          Domado_.handleUncaughtException(tameWindow, e,
+              '<' + tameEventObj.type + ' listener>');
         }
       }
 
@@ -21300,13 +23267,16 @@ var Domado = (function() {
       defineElement({
         domClass: 'HTMLAnchorElement',
         properties: function() { return {
+          // TODO(kpreid): Implement all components-of-the-URL properties in
+          // a generic and consistently-virtualized way.
           hash: PT.filter(
             false,
             function (value) { return unsuffix(value, idSuffix, value); },
             false,
             // TODO(felix8a): add suffix if href is self
             identity),
-          href: NP_UriValuedProperty('a', 'href')
+          href: NP_UriValuedProperty('a', 'href'),
+          pathname: PT.ROView(String)
         }; }
       });
 
@@ -23564,7 +25534,8 @@ var Domado = (function() {
                 window.ActiveXObject,
                 window.XDomainRequest),
             naiveUriPolicy,
-            function () { return domicile.pseudoLocation.href; }));
+            function () { return domicile.pseudoLocation.href; },
+            tameWindow));
       });
 
 
@@ -24038,12 +26009,14 @@ var Domado = (function() {
       var domicile = windowToDomicile.get(imports);
       var node = domicile.tameNode(thisNode);
       var isUserAction = eventIsUserAction(event, window);
+      var tameEventObj = domicile.tameEvent(event);
       try {
         return dispatch(
           isUserAction, pluginId, handler,
-          [ node, domicile.tameEvent(event) ]);
+          [ node, tameEventObj ]);
       } catch (ex) {
-        imports.onerror(ex.message, 'unknown', 0);
+        Domado_.handleUncaughtException(imports, ex,
+            '<' + tameEventObj.type + ' handler>');
       }
     }
 
@@ -24109,7 +26082,64 @@ var Domado = (function() {
       plugin_dispatchToHandler: plugin_dispatchToHandler,
       getDomicileForWindow: windowToDomicile.get.bind(windowToDomicile)
     });
+  }
+  
+  /**
+   * Invoke the possibly guest-supplied onerror handler due to an uncaught
+   * exception. This wrapper exists to ensure consistent behavior among the
+   * many places we need "top-level" catches. It is not a part of the domicile
+   * object because it is used even in DOM-less guest environments, but is in
+   * this file because it is a "browser" feature rather than a "JS" feature.
+   *
+   * handleUncaughtException attempts to never throw, even if the onerror
+   * handler is not a function, stringifying the exception throws, and so
+   * on.
+   *
+   * Usage:
+   * try {
+   *   ...guest callback of some sort, say an event handler...
+   * } catch (e) {
+   *   handleUncaughtException(tameWindow, e, 'event handler');
+   * }
+   *
+   * @param {Object} globalObj Object on which to find the onerror handler.
+   * @param {Error} error
+   * @param {string} context Script source URL if available, otherwise
+   *     a user-facing explanation of what kind of top-level handler caught
+   *     this error, in angle brackets; e.g. '<event listener>' or
+   *     '<setTimeout>'.
+   */
+  Domado_.handleUncaughtException =
+      cajaVM.constFunc(function(globalObj, error, context) {
+    // This is an approximate implementation of
+    // https://html.spec.whatwg.org/multipage/webappapis.html#runtime-script-errors
+    // The error event object is implicit.
+    try {
+      // Call with this == globalObj; this is intended behavior.
+      // Refs for arguments:
+      // https://html.spec.whatwg.org/multipage/webappapis.html#event-handler-attributes:onerroreventhandler
+      // https://developer.mozilla.org/en-US/docs/Web/API/GlobalEventHandlers.onerror
+      globalObj.onerror(
+        'Uncaught ' + error,
+        context,
+        // TODO(kpreid): Once there is a standardized error stack trace
+        // interface, use it to recover more error information if we can.
+        -1,  // line number
+        -1,  // column number
+        error);
+    } catch (e) {
+      if (typeof console !== 'undefined') {
+        try {
+          console.error('Error while reporting guest script error: ', e);
+        } catch (metaError) {
+          console.error('Error while reporting error while reporting ' +
+              'guest script error. Sorry.');
+        }
+      }
+    }
   });
+  
+  return cajaVM.constFunc(Domado_);
 })();
 
 // Exports for closure compiler.
@@ -24544,25 +26574,30 @@ function TamingMembrane(helper, schema) {
    */
   function copyTreatedImmutable(o) {
     var t = void 0;
+    // Object.prototype.toString is spoofable (as of ES6). Therefore, each
+    // branch of this switch must assume that o is not necessarily of the type
+    // and defend against that. However, we consider it acceptable for a
+    // spoofing object to be copied as one of what it was spoofing, or to cause
+    // an error.
     switch (Object.prototype.toString.call(o)) {
       case '[object Boolean]':
-        t = new Boolean(o.valueOf());
+        t = new Boolean(!!o.valueOf());
         break;
       case '[object Date]':
-        t = new Date(o.valueOf());
+        t = new Date(+o.valueOf());
         break;
       case '[object Number]':
-        t = new Number(o.valueOf());
+        t = new Number(+o.valueOf());
         break;
       case '[object RegExp]':
         t = new RegExp(
-            o.source,
+            '' + o.source,
             (o.global ? 'g' : '') +
             (o.ignoreCase ? 'i' : '') +
             (o.multiline ? 'm' : ''));
         break;
       case '[object String]':
-        t = new String(o.valueOf());
+        t = new String('' + o.valueOf());
         break;
       case '[object Error]':
       case '[object DOMException]':
@@ -24610,7 +26645,28 @@ function TamingMembrane(helper, schema) {
     }
     return Object.freeze(copy);
   }
-  
+
+  /**
+   * Helper function; return a copy of a typed array object without depending on
+   * the typed array constructor to do it.
+   *
+   * This is needed, or at least reasonable caution, because typed array
+   * constructors have overloads that will share an ArrayBuffer with the
+   * provided value, rather than copying. In current specification and
+   * implementation it does not appear to be possible to create an object which
+   * exploits this, but we don't wish to rely on that invariant.
+   */
+  function copyTArray(ctor, o) {
+    // Get a copy of the relevant portion of the underlying buffer in a way
+    // which has no overloads and guarantees a copy.
+    var byteOffset = +o.byteOffset;
+    var byteLength = +o.byteLength;
+    var buffer = ArrayBuffer.prototype.slice.call(
+        o.buffer, o.byteOffset, o.byteOffset + o.byteLength);
+    
+    return new ctor(buffer);
+  }
+
   /**
    * Given a builtin object "o" from either side of the membrane, return a copy
    * constructed in the taming frame. Return undefined if "o" is not of a type
@@ -24627,21 +26683,28 @@ function TamingMembrane(helper, schema) {
       return copyArray(o, recursor);
     } else {
       var t = undefined;
+      // Object.prototype.toString is spoofable (as of ES6). Therefore, each
+      // branch of this switch must assume that o is not necessarily of the type
+      // and defend against that. However, we consider it acceptable for a
+      // spoofing object to be copied as one of what it was spoofing, or to
+      // cause an error.
       switch (Object.prototype.toString.call(o)) {
         // Note that these typed array tamings break any buffer sharing, but
         // that's in line with our general policy of copying.
         case '[object ArrayBuffer]':
+          // ArrayBuffer.prototype.slice will always copy or throw TypeError
           t = ArrayBuffer.prototype.slice.call(o, 0);
           break;
-        case '[object Int8Array]': t = new Int8Array(o); break;
-        case '[object Uint8Array]': t = new Uint8Array(o); break;
-        case '[object Uint8ClampedArray]': t = new Uint8ClampedArray(o); break;
-        case '[object Int16Array]': t = new Int16Array(o); break;
-        case '[object Uint16Array]': t = new Uint16Array(o); break;
-        case '[object Int32Array]': t = new Int32Array(o); break;
-        case '[object Uint32Array]': t = new Uint32Array(o); break;
-        case '[object Float32Array]': t = new Float32Array(o); break;
-        case '[object Float64Array]': t = new Float64Array(o); break;
+        case '[object Int8Array]': t = copyTArray(Int8Array, o); break;
+        case '[object Uint8Array]': t = copyTArray(Uint8Array, o); break;
+        case '[object Uint8ClampedArray]':
+            t = copyTArray(Uint8ClampedArray, o); break;
+        case '[object Int16Array]': t = copyTArray(Int16Array, o); break;
+        case '[object Uint16Array]': t = copyTArray(Uint16Array, o); break;
+        case '[object Int32Array]': t = copyTArray(Int32Array, o); break;
+        case '[object Uint32Array]': t = copyTArray(Uint32Array, o); break;
+        case '[object Float32Array]': t = copyTArray(Float32Array, o); break;
+        case '[object Float64Array]': t = copyTArray(Float64Array, o); break;
         case '[object DataView]':
           t = new DataView(recursor(o.buffer), o.byteOffset, o.byteLength);
           break;
@@ -24689,7 +26752,7 @@ function TamingMembrane(helper, schema) {
     if ((f && tameByFeral.has(f)) || (t && feralByTame.has(t))) {
       var et = tameByFeral.get(f);
       var ef = feralByTame.get(t);
-      throw new TypeError('Attempt to multiply tame: ' + f + 
+      throw new TypeError('Attempt to multiply tame: ' + f +
           (ef ? ' (already ' + (ef === f ? 'same' : ef) + ')' : '') +
           ' <-> ' + t +
           (et ? ' (already ' + (et === t ? 'same' : et) + ')' : ''));
@@ -24854,6 +26917,7 @@ function TamingMembrane(helper, schema) {
           helper.USELESS,  // See notes on USELESS above
           copyArray(arguments, untame));
     };
+    t = helper.funcLike(t, f);
     addFunctionPropertyHandlers(f, t);
     preventExtensions(t);
     return t;
@@ -24877,6 +26941,7 @@ function TamingMembrane(helper, schema) {
         tamesTo(o, this);
       }
     };
+    t = helper.funcLike(t, f);
 
     if (tameByFeral.get(fPrototype)) {
       throw new TypeError(
@@ -24925,27 +26990,32 @@ function TamingMembrane(helper, schema) {
           untame(this),
           copyArray(arguments, untame));
     };
+    t = helper.funcLike(t, f);
     addFunctionPropertyHandlers(f, t);
     preventExtensions(t);
     return t;
   }
 
   function makePrototypeMethod(proto, func) {
-    return function(_) {
+    var m = function(_) {
       if (!inheritsFrom(this, proto)) {
         throw new TypeError('Target object not permitted: ' + this);
       }
       return func.apply(this, arguments);
     };
+    m = helper.funcLike(m, func);
+    return m;
   }
 
   function makeStrictPrototypeMethod(proto, func) {
-    return function(_) {
+    var m = function(_) {
       if ((this === proto) || !inheritsFrom(this, proto)) {
         throw new TypeError('Target object not permitted: ' + this);
       }
       return func.apply(this, arguments);
     };
+    m = helper.funcLike(m, func);
+    return m;
   }
 
   function inheritsFrom(o, proto) {
@@ -25064,9 +27134,11 @@ function TamingMembrane(helper, schema) {
   function untameCajaFunction(t) {
     // Untaming of *constructors* which are defined in Caja is unsupported.
     // We untame all functions defined in Caja as xo4a.
-    return function(_) {
+    var f = function(_) {
       return applyTameFunction(t, tame(this), copyArray(arguments, tame));
     };
+    f = helper.funcLike(f, t);
+    return f;
   }
 
   function untameCajaRecord(t) {
@@ -25111,7 +27183,7 @@ function TamingMembrane(helper, schema) {
     reTamesTo: reTamesTo,
     hasTameTwin: hasTameTwin,
     hasFeralTwin: hasFeralTwin,
-    
+
     // Any code which bypasses the membrane (e.g. in order to provide its own
     // tame twins, as Domado does) must also filter exceptions resulting from
     // control flow crossing the membrane.
@@ -25150,7 +27222,7 @@ var Q;
   "use strict";
 
   // Table of functions-which-are-promises
-  var promises = new WeakMap(true);
+  var promises = new WeakMap();
 
   function reject(reason) {
     function rejected(op, arg1, arg2, arg3) {
@@ -25215,7 +27287,7 @@ var Q;
     promises.set(fulfilled, true);
     return fulfilled;
   }
- 	
+
   var enqueue = (function () {
     var active = false;
     var pending = [];
@@ -25236,7 +27308,7 @@ var Q;
       }
     };
   }());
- 	
+
   /**
    * Enqueues a promise operation.
    *
@@ -25745,6 +27817,7 @@ function SESFrameGroup(cajaInt, config, tamingWin, feralWin,
       isDefinedInCajaFrame: cajaFrameTracker.isDefinedInCajaFrame,
       USELESS: USELESS,
       weakMapPermitHostObjects: ses.weakMapPermitHostObjects,
+      funcLike: ses.funcLike,
       allFrames: allFrames
   });
 
@@ -25794,6 +27867,13 @@ function SESFrameGroup(cajaInt, config, tamingWin, feralWin,
 
     USELESS: USELESS,
     iframe: window.frameElement,
+
+    // For clients which need to know details/quirks.
+    // These are functions so that the caja.js "premature" mechanism works.
+    // These are individual questions so that it can be expanded to cover
+    // unforeseen future cases ("almost like", "none of the above").
+    isES53: function() { return false; },
+    isSES: function() { return true; },
 
     Q: Q,
 
@@ -25972,7 +28052,12 @@ function SESFrameGroup(cajaInt, config, tamingWin, feralWin,
     }
 
     Q.when(promise, function (compiledFunc) {
-      var result = compiledFunc(imports);
+      var result = undefined;
+      try {
+        result = compiledFunc(imports);
+      } catch (e) {
+        Domado.handleUncaughtException(imports, e, gman.getUrl());
+      }
       if (opt_runDone) {
         opt_runDone(result);
       }
