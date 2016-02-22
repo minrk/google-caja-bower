@@ -1,4 +1,4 @@
-{var cajaBuildVersion='6001',CSS_PROP_BIT_GLOBAL_NAME,CSS_PROP_BIT_HASH_VALUE,CSS_PROP_BIT_NEGATIVE_QUANTITY,CSS_PROP_BIT_PROPERTY_NAME,CSS_PROP_BIT_QSTRING,CSS_PROP_BIT_QUANTITY,CSS_PROP_BIT_UNICODE_RANGE,CSS_PROP_BIT_UNRESERVED_WORD,CSS_PROP_BIT_URL,Domado,Error,Function,HtmlSchema,Q,RegExp,StringMap,URI,WeakMap,bridalMaker,cajaFrameTracker,cajaVM,cssSchema,decodeCss,eval,html,html4,htmlSchema,html_sanitize,lexCss,parseCssDeclarations,parseCssStylesheet,sanitizeCssProperty,sanitizeCssSelectorList,sanitizeMediaQuery,sanitizeStylesheet,sanitizeStylesheetWithExternals,ses,unicode;typeof
+{var cajaBuildVersion='6002',CSS_PROP_BIT_GLOBAL_NAME,CSS_PROP_BIT_HASH_VALUE,CSS_PROP_BIT_NEGATIVE_QUANTITY,CSS_PROP_BIT_PROPERTY_NAME,CSS_PROP_BIT_QSTRING,CSS_PROP_BIT_QUANTITY,CSS_PROP_BIT_UNICODE_RANGE,CSS_PROP_BIT_UNRESERVED_WORD,CSS_PROP_BIT_URL,Domado,Error,Function,HtmlSchema,Q,RegExp,StringMap,URI,WeakMap,bridalMaker,cajaFrameTracker,cajaVM,cssSchema,decodeCss,eval,html,html4,htmlSchema,html_sanitize,lexCss,parseCssDeclarations,parseCssStylesheet,sanitizeCssProperty,sanitizeCssSelectorList,sanitizeMediaQuery,sanitizeStylesheet,sanitizeStylesheetWithExternals,ses,unicode;typeof
 window!=='undefined'&&(window['cajaBuildVersion']=cajaBuildVersion),ses||(ses={}),(function
 loggerModule(){'use strict';var apply,forward,logger,slice;function logNowhere(str){}slice=[].slice,apply=slice.apply,ses.logger?(logger=ses.logger):typeof
 console!=='undefined'&&'log'in console?(forward=function(level,args){var getStack,i,len,stack;args=slice.call(args,0),apply.call(console[level],console,[''].concat(args)),getStack=ses.getStack;if(getStack)for(i=0,len=args.length;i<len;++i)stack=getStack(args[i]),stack&&console[level]('',stack)},logger={'log':function
@@ -515,9 +515,11 @@ OurWeakMap),omap.set(key,value)),this}:function(key,value){if(enableSwitching)tr
 OurWeakMap),omap.set___(key,value)}else hmap.set(key,value);return this};function
 ddelete(key){var result=!!hmap['delete'](key);return omap?omap.delete___(key)||result:result}return Object.create(OurWeakMap.prototype,{'get___':{'value':constFunc(dget)},'has___':{'value':constFunc(dhas)},'set___':{'value':constFunc(dset)},'delete___':{'value':constFunc(ddelete)},'permitHostObjects___':{'value':constFunc(function(token){if(token===weakMapPermitHostObjects){enableSwitching=true}else{throw new
 Error('bogus call to permitHostObjects___')}})}})}return DoubleWeakMap.prototype=OurWeakMap.prototype,Object.defineProperty(DoubleWeakMap.prototype,'constructor',{'value':DoubleWeakMap,'enumerable':false,'configurable':true,'writable':true}),DoubleWeakMap}})(),(function
-debugModule(global){'use strict';var UnsafeError;if(typeof ses!=='undefined'&&ses.okToLoad&&!ses.okToLoad())return;UnsafeError=Error,ses.UnsafeError=Error;function
-FakeError(message){return UnsafeError(message)}FakeError.prototype=UnsafeError.prototype,FakeError.prototype.constructor=FakeError,Error=FakeError,ses.getCWStack=function
-uselessGetCWStack(err){return},'captureStackTrace'in UnsafeError?(function(){var
+debugModule(global){'use strict';var UnsafeError,primStackDesc,primStackGetter;if(typeof
+ses!=='undefined'&&ses.okToLoad&&!ses.okToLoad())return;UnsafeError=Error;function
+FakeError(message){return UnsafeError(message)}FakeError.prototype=UnsafeError.prototype,FakeError.prototype.constructor=FakeError,ses.UnsafeError=Error,Error=FakeError,[EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError].forEach(function(err){Object.getPrototypeOf(err)===UnsafeError&&Object.setPrototypeOf(err,FakeError)}),ses.getCWStack=function
+uselessGetCWStack(err){return},primStackDesc=Object.getOwnPropertyDescriptor(Error.prototype,'stack'),primStackGetter=primStackDesc&&primStackDesc.get||function
+legacyPrimStackGetter(){return this.stack},'captureStackTrace'in UnsafeError?(function(){var
 ssts,unsafeCaptureStackTrace;UnsafeError.prepareStackTrace=function(err,sst){return ssts===void
 0?ses.logger.error('Error while initializing debug module',err):ssts.set(err,sst),void
 0},unsafeCaptureStackTrace=UnsafeError.captureStackTrace,UnsafeError.captureStackTrace=function(obj,opt_MyError){var
@@ -525,15 +527,16 @@ wasFrozen=Object.isFrozen(obj),stackDesc=Object.getOwnPropertyDescriptor(obj,'st
 obj.stack,Object.freeze(obj))}},ssts=new WeakMap;function getCWStack(err){var ignore,sst;return Object(err)!==err?void
 0:(sst=ssts.get(err),sst===void 0&&err instanceof Error&&(ignore=err.stack,sst=ssts.get(err)),sst===void
 0?void 0:{'calls':sst.map(function(frame){return{'name':''+(frame.getFunctionName()||frame.getMethodName()||'?'),'source':''+(frame.getFileName()||'?'),'span':[[frame.getLineNumber(),frame.getColumnNumber()]]}})})}ses.getCWStack=getCWStack})():(function(){var
-FFFramePattern=/^\s*([^:@(]*?)\s*(?:\(.*\))?@(.*?)$/,IEFramePattern=/^\s*(?:at\s+)?([^:@(]*?)\s*\((.*?)\)$/,JSCFramePatt1=/^\s*([^:@(]*?)\s*(?:@(.*?))?$/,JSCFramePatt2=/^\s*?([^:@(]*?)\s*?(.*?)$/,framePatterns=[FFFramePattern,IEFramePattern,JSCFramePatt1,JSCFramePatt2],FFEvalLineColPatterns=/^(?:.*?) line \d+ \x3e eval():(\d+):(\d+)$/,MainLineColPattern=/^(.*?)(?::(\d+)(?::(\d+))?)?$/,lineColPatterns=[FFEvalLineColPatterns,MainLineColPattern];function
-getCWStack(err){var frames,lines,stack;return err instanceof Error?(stack=err.stack,stack?(lines=stack.split('\n'),/^\w*Error:/.test(lines[0])&&(lines=lines.slice(1)),frames=lines.map(function(line){var
+FFFramePattern=/^\s*([^:@(]*?)\s*(?:\(.*\))?@(.*?)$/,IEFramePattern=/^\s*(?:at\s+)?([^:@(]*?)\s*\((.*?)\)$/,JSCFramePatt1=/^\s*([^:@(]*?)\s*(?:@(.*?))?$/,JSCFramePatt2=/^\s*?([^:@(]*?)\s*?(.*?)$/,framePatterns=[FFFramePattern,IEFramePattern,JSCFramePatt1,JSCFramePatt2],FFEvalLineColPatterns=/^(.*?) line (\d+) \x3e (?:[^:]*):(?:\d+):(?:\d+)$/,MainLineColPattern=/^(.*?)(?::(\d+)(?::(\d+))?)?$/,lineColPatterns=[FFEvalLineColPatterns,MainLineColPattern];function
+getCWStack(err){var stack=void 0,frames,lines;try{stack=primStackGetter.call(err)}catch(_){}return typeof
+stack!=='string'||stack===''?void 0:(lines=stack.split('\n'),/^\w*Error:/.test(lines[0])&&(lines=lines.slice(1)),lines=lines.filter(function(line){return line!==''}),frames=lines.map(function(line){var
 name=line.trim(),source='?',span=[],parts;return framePatterns.some(function(framePattern){var
 match=framePattern.exec(line);return match?(name=match[1]||'?',source=match[2]||'?',lineColPatterns.some(function(lineColPattern){var
-sub=lineColPattern.exec(source);return sub?(source=sub[1]||'?',sub[2]&&(sub[3]?(span=[[+sub[2],+sub[3]]]):(span=[[+sub[2]]])),true):false}),true):false}),name==='Anonymous function'?(name='?'):name.indexOf('/')!==-1&&(name=name.replace(/[\/\x3c]/g,''),parts=name.split('/'),name=parts[parts.length-1]),(source==='Unknown script code'||source==='eval code')&&(source='?'),{'name':name,'source':source,'span':span}}),{'calls':frames}):void
-0):void 0}ses.getCWStack=getCWStack})();function stackString(cwStack){var calls,result;return cwStack?(calls=cwStack.calls,result=calls.map(function(call){var
+sub=lineColPattern.exec(source);return sub?(source=sub[1]||'?',sub[2]&&(sub[3]?(span=[[+sub[2],+sub[3]]]):(span=[[+sub[2]]])),true):false}),true):false}),name==='Anonymous function'?(name='?'):name.indexOf('/')!==-1&&(name=name.replace(/[\/\x3c]/g,''),parts=name.split('/'),name=parts[parts.length-1]),(source==='Unknown script code'||source==='eval code')&&(source='?'),{'name':name,'source':source,'span':span}}),{'calls':frames})}ses.getCWStack=getCWStack})();function
+stackString(cwStack){var calls,result;return cwStack?(calls=cwStack.calls,result=calls.map(function(call){var
 spanString=call.span.map(function(subSpan){return subSpan.join(':')}).join('::');return spanString&&(spanString=':'+spanString),'  at '+call.name+' ('+call.source+spanString+')'}),result.join('\n')):void
 0}ses.stackString=stackString;function getStack(err){var cwStack,result;if(err!==Object(err))return;cwStack=ses.getCWStack(err);if(cwStack)result=ses.stackString(cwStack);else
-if(err instanceof Error&&'stack'in err&&typeof(result=err.stack)==='string');else
+if(err instanceof Error&&typeof(result=primStackGetter.call(err))==='string'&&result!=='');else
 return;return err instanceof Error&&(result=err+'\n'+result),result}ses.getStack=getStack})(this),(function(){'use strict';var
 create,createNull,freeze;create=Object.create,freeze=Object.freeze;function constFunc(func){return func.prototype=null,freeze(func)}function
 assertString(x){if('string'!==typeof x)throw new TypeError(('Not a string: '+x));return x}typeof
