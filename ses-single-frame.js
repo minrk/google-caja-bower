@@ -22,7 +22,7 @@
  * @overrides window
  */
 
-var cajaBuildVersion = '6006';
+var cajaBuildVersion = '6011';
 
 // Exports for closure compiler.
 if (typeof window !== 'undefined') {
@@ -1869,7 +1869,7 @@ var ses;
     // noFuncPoison-ing, this should be caught by
     // test_THROWTYPEERROR_NOT_UNIQUE below, so we assume here that
     // this is the only surviving ThrowTypeError intrinsic.
-    result.ThrowTypeError = gopd(arguments, 'caller').get;
+    result.ThrowTypeError = gopd(arguments, 'callee').get;
 
     // Get the ES6 %ArrayIteratorPrototype%, %StringIteratorPrototype%,
     // and %IteratorPrototype% intrinsics, if present.
@@ -2228,7 +2228,11 @@ var ses;
    * arity.
    */
   function makeStandinMaker(standinName, arity) {
-    if (!/[a-zA-Z][a-zA-Z0-9]*/.test(standinName)) {
+    // Allow approximations of function names like "bound f".
+    standinName = standinName.replace(/ /g, '_');
+
+    // Reject names that could be syntax errors.
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(standinName)) {
       standinName = 'standin';
     }
     var cacheLine = standinMakerCache.get(standinName);
@@ -2236,6 +2240,7 @@ var ses;
       standinName = 'standin';
       cacheLine = standinMakerCache.get(standinName);
     }
+
     if (!cacheLine) {
       cacheLine = [];
       standinMakerCache.set(standinName, cacheLine);
@@ -8768,9 +8773,11 @@ var ses;
         filter: t,
         reduce: t,
         reduceRight: t,
-        length: t
+        length: t,
+        from: t
       },
-      isArray: t
+      isArray: t,
+      from: t
     },
     String: {
       prototype: {
@@ -9039,7 +9046,7 @@ var ses;
  * // provides ses.atLeastFreeVarNames
  * // provides ses.limitSrcCharset
  * @author Mark S. Miller
- * @requires StringMap
+ * @requires StringMap, JSON
  * @overrides ses, atLeastFreeVarNamesModule
  */
 var ses;
@@ -9110,8 +9117,9 @@ var ses;
     + '\\u2028\\u2029\\u200f\\u205F\\u3000]');
 
   /**
-   * We use this to limit the input text to ascii only text.  All other
-   * characters are encoded using backslash-u escapes.
+   * We use this to limit the input text to ascii only text or \u00A0
+   * which is no-break-space. All other characters are encoded using
+   * backslash-u escapes.
    */
   ses.limitSrcCharset = function(programSrc) {
     if (OTHER_WHITESPACE.test(programSrc)) {
@@ -9126,13 +9134,29 @@ var ses;
 
   /**
    * Return a regexp that can be used repeatedly to scan for the next
-   * identifier. It works correctly in concert with ses.limitSrcCharset above.
+   * identifier. It works correctly in concert with
+   * ses.limitSrcCharset above.
    *
-   * If this regexp is changed, compileExprLater.js should be checked for
-   * correct escaping of freeNames.
+   * Note that ES6 section 11.8.4 extends the syntax of identifiers to
+   * include the unicode escape sequence
+   * backslash-u-opencurly-hexdigits-closecurly. By including it in
+   * this pattern, we ensure that we still recognize an identifier as
+   * a unit. However, this is not valid JSON syntax, so the JSON.parse
+   * will reject these with an exception rather than decode it into an
+   * identifier string.
    */
   function SHOULD_MATCH_IDENTIFIER() {
-    return /(\w|\\u\d{4}|\$)+/g;
+    return /(?:\w|\\u[0-9a-fA-F]{4}|\\u{[0-9a-fA-F]*}|\$)+/g;
+  }
+
+  /**
+   * Sequences beginning with a digit will pass the
+   * SHOULD_MATCH_IDENTIFIER() pattern but are trivially not
+   * identifiers. This returns true only if name does not begin with a
+   * digit.
+   */
+  function filterIdentifier(name) {
+    return /^\D/.test(name);
   }
 
   //////////////// END KLUDGE SWITCHES ///////////
@@ -9167,9 +9191,30 @@ var ses;
       // apparently unique identifiers.
       var name = a[0];
 
-      if (!found.has(name)) {
-        result.push(name);
-        found.set(name, true);
+      if (filterIdentifier(name)) {
+        // Parse \u escapes occurring inside the name. No other special
+        // characters can occur, because the input is known to match
+        // SHOULD_MATCH_IDENTIFIER(). SHOULD_MATCH_IDENTIFIER() will
+        // admit backslash-u-opencurly-hexdigits-closecurly which
+        // JSON.parse will reject with an error. We could and probably
+        // should eventually admit this standard non-JSON escape
+        // sequence, but for simplicity and lack of current demand, we
+        // do not yet do so.
+        try {
+          name = JSON.parse('"' + name + '"');
+        } catch (err) {
+          if (err instanceof SyntaxError) {
+            // Since we are rejecting a valid program, at least make
+            // the diagnostic more informative.
+            err.message += ' in ' + name;
+          }
+          throw err;
+        }
+
+        if (!found.has(name)) {
+          result.push(name);
+          found.set(name, true);
+        }
       }
     }
     return result;
@@ -9211,6 +9256,7 @@ var ses;
  * //provides ses.startSES ses.resolveOptions, ses.securableWrapperSrc
  * //provides ses.makeCompiledExpr ses.prepareExpr
  * //provides ses._primordialsHaveBeenFrozen
+ * //provides ses.resampleGlobal
  *
  * @author Mark S. Miller,
  * @author Jasvir Nagra
@@ -9714,6 +9760,70 @@ ses.startSES = function(global,
   }
 
 
+  /**
+   * All scopeObjects inherit from the one returned scopeBackstop
+   * object, just in case the normal makeScopeObject protections fail,
+   * leaving open a possible vulnerability. For every global variable
+   * name found by inspecting the global object, the backstop has a
+   * poisoned property shadowing that global variable.
+   *
+   * The remaining imperfection is that new globals may be added after
+   * the global object has been sampled. We provide the
+   * ses.resampleGlobal() hook so that our client can advise us that
+   * we need to resample it. We update the one returned scopeBackstop
+   * object, rather than making a new one, to protect us against old
+   * code accessing new variables.
+   */
+  var getBackstop = (function() {
+
+    var scopeBackstop = createNullIfPossible();
+    // createNullIfPossible safety: We explicitly censor all the own
+    // properties of Object.prototype below.
+    var needSample = true;
+
+    /**
+     * Call this after adding new global variables to this realm,
+     * before giving any other untrusted code a chance to run.
+     */
+    function resampleGlobal() {
+      gopn(Object.prototype).forEach(censor);
+      for (var hidden = global; hidden; hidden = getProto(hidden)) {
+        gopn(hidden).forEach(censor);
+      }
+      needSample = false;
+    }
+    ses.resampleGlobal = resampleGlobal;
+
+    /**
+     * Because there are often a lot of global properties, for speed,
+     * we reuse this single function as the getters and setters for
+     * all of them. The price is that the diagnostic cannot identify
+     * the name of forbidden variable being accessed.
+     *
+     * Since this is only used as a backstop anyway, this
+     * uninformative diagnostic should only be seen if the normal
+     * makeScopeObject protections fail.
+     */
+    function badGlobalAccess() {
+      throw new ReferenceError('Access to forbidden global variable');
+    }
+
+    function censor(name) {
+      defProp(scopeBackstop, name, {
+        get: badGlobalAccess,
+        set: badGlobalAccess,
+        enumerable: false,
+        configurable: false
+      });
+    }
+
+    return function getBackstop() {
+      if (needSample) { resampleGlobal(); }
+      return scopeBackstop;
+    };
+  }());
+
+
   (function startSESPrelude() {
 
     /**
@@ -9824,10 +9934,7 @@ ses.startSES = function(global,
      * {@code imports}.
      */
     function makeScopeObject(imports, freeNames, options) {
-      var scopeObject = createNullIfPossible();
-      // createNullIfPossible safety: The inherited properties should
-      // always be shadowed by defined properties if they are relevant
-      // (that is, if they occur in freeNames).
+      var scopeObject = create(getBackstop());
 
       // Note: Although this loop is a bottleneck on some platforms,
       // it does not help to turn it into a for(;;) loop, since we
@@ -10049,8 +10156,11 @@ ses.startSES = function(global,
       if (exprSrc[exprSrc.length - 1] === ';') {
         exprSrc = exprSrc.substr(0, exprSrc.length - 1);
       }
-      var wrapperSrc = securableWrapperSrc(exprSrc);
+      // If both of these would throw an error, the error from
+      // atLeastFreeVarNames is likely to be more informative, so we
+      // call it first.
       var freeNames = atLeastFreeVarNames(exprSrc);
+      var wrapperSrc = securableWrapperSrc(exprSrc);
 
       var suffixSrc;
       var sourceUrl = options.sourceUrl;
@@ -10417,6 +10527,17 @@ ses.startSES = function(global,
       })();
       if (nativeProxies) {
         (function () {
+          function coerceProp(P) {
+            if (typeof P === 'symbol') {
+              return P;
+            } else {
+              return '' + P;
+            }
+          }
+          function isNumericString(P) {
+            return typeof P === 'string' && P == '' + (+P);
+          }
+
           function ArrayLike(proto, getItem, getLength) {
             if (typeof proto !== 'object') {
               throw new TypeError('Expected proto to be an object.');
@@ -10431,14 +10552,14 @@ ses.startSES = function(global,
           }
 
           function ownPropDesc(P) {
-            P = '' + P;
+            P = coerceProp(P);
             if (P === 'length') {
               return {
                 get: lengthGetter,
                 enumerable: false,
                 configurable: true  // required proxy invariant
               };
-            } else if (typeof P === 'number' || P === '' + (+P)) {
+            } else if (isNumericString(P)) {
               return {
                 get: constFunc(function() {
                   var getter = itemMap.get(this);
@@ -10451,6 +10572,7 @@ ses.startSES = function(global,
             return void 0;
           }
           function propDesc(P) {
+            P = coerceProp(P);
             var opd = ownPropDesc(P);
             if (opd) {
               return opd;
@@ -10459,10 +10581,10 @@ ses.startSES = function(global,
             }
           }
           function get(O, P) {
-            P = '' + P;
+            P = coerceProp(P);
             if (P === 'length') {
               return lengthGetter.call(O);
-            } else if (typeof P === 'number' || P === '' + (+P)) {
+            } else if (isNumericString(P)) {
               var getter = itemMap.get(O);
               return getter ? getter(+P) : void 0;
             } else {
@@ -10472,17 +10594,14 @@ ses.startSES = function(global,
             }
           }
           function has(P) {
-            P = '' + P;
+            P = coerceProp(P);
             return (P === 'length') ||
-                (typeof P === 'number') ||
-                (P === '' + +P) ||
+                isNumericString(P) ||
                 (P in Object.prototype);
           }
           function hasOwn(P) {
-            P = '' + P;
-            return (P === 'length') ||
-                (typeof P === 'number') ||
-                (P === '' + +P);
+            P = coerceProp(P);
+            return P === 'length' || isNumericString(P);
           }
           function getPN() {
             var result = getOwnPN ();
@@ -10497,8 +10616,12 @@ ses.startSES = function(global,
             return ['length'];
           };
           function del(P) {
-            P = '' + P;
-            if ((P === 'length') || ('' + +P === P)) { return false; }
+            P = coerceProp(P);
+            if (P === 'length' || isNumericString(P)) {
+              // Non-deletable property.
+              return false;
+            }
+            // Nonexistent property.
             return true;
           }
 
@@ -11886,7 +12009,7 @@ if (typeof window !== 'undefined') {
 ;
 /* Copyright Google Inc.
  * Licensed under the Apache Licence Version 2.0
- * Autogenerated at Mon Mar 13 14:35:25 CET 2017
+ * Autogenerated at Mon Mar 13 14:39:19 CET 2017
  * \@overrides window
  * \@provides cssSchema, CSS_PROP_BIT_QUANTITY, CSS_PROP_BIT_HASH_VALUE, CSS_PROP_BIT_NEGATIVE_QUANTITY, CSS_PROP_BIT_QSTRING, CSS_PROP_BIT_URL, CSS_PROP_BIT_UNRESERVED_WORD, CSS_PROP_BIT_UNICODE_RANGE, CSS_PROP_BIT_GLOBAL_NAME, CSS_PROP_BIT_PROPERTY_NAME */
 /**
@@ -12635,7 +12758,7 @@ if (typeof window !== 'undefined') {
 ;
 // Copyright Google Inc.
 // Licensed under the Apache Licence Version 2.0
-// Autogenerated at Mon Mar 13 14:35:25 CET 2017
+// Autogenerated at Mon Mar 13 14:39:20 CET 2017
 // @overrides window
 // @provides html4
 var html4 = {};
@@ -14287,7 +14410,7 @@ var html = (function(html4) {
     });
   }
 
-  var ALLOWED_URI_SCHEMES = /^(?:https?|mailto)$/i;
+  var ALLOWED_URI_SCHEMES = /^(?:https?|geo|mailto|sms|tel)$/i;
 
   function safeUri(uri, effect, ltype, hints, naiveUriRewriter) {
     if (!naiveUriRewriter) { return null; }
@@ -17076,7 +17199,7 @@ var sanitizeMediaQuery = undefined;
       ':)?'
   );
 
-  var ALLOWED_URI_SCHEMES = /^(?:https?|mailto)$/i;
+  var ALLOWED_URI_SCHEMES = /^(?:https?|geo|mailto|sms|tel)$/i;
 
   function resolveUri(baseUri, uri) {
     if (baseUri) {
@@ -19161,7 +19284,7 @@ var Domado = (function() {
       ':)?'
   );
 
-  var ALLOWED_URI_SCHEMES = /^(?:https?|mailto)$/i;
+  var ALLOWED_URI_SCHEMES = /^(?:https?|geo|mailto|sms|tel)$/i;
 
   /**
    * Tests if the given uri has an allowed scheme.
@@ -20613,6 +20736,8 @@ var Domado = (function() {
      * @param {number} y y-coord of a pixel in the element's frame of reference.
      */
     function tameScrollTo(element, x, y) {
+      x = x || 0;
+      y = y || 0;
       if (x !== +x || y !== +y || x < 0 || y < 0) {
         throw new Error('Cannot scroll to ' + x + ':' + typeof x + ','
                         + y + ' : ' + typeof y);
@@ -20989,17 +21114,6 @@ var Domado = (function() {
 
       var elementPolicies = {};
       elementPolicies.form = function (attribs) {
-        // Forms must have a gated onsubmit handler or they must have an
-        // external target.
-        var sawHandler = false;
-        for (var i = 0, n = attribs.length; i < n; i += 2) {
-          if (attribs[+i] === 'onsubmit') {
-            sawHandler = true;
-          }
-        }
-        if (!sawHandler) {
-          attribs.push('onsubmit', 'return false');
-        }
         return forceAutocompleteOff(attribs);
       };
       elementPolicies.input = function (attribs) {
@@ -21397,14 +21511,9 @@ var Domado = (function() {
             )(tameWindow);
             var fnNameExpr = domicile.handlers.push(handlerFn) - 1;
 
-            var trustedHandler = '___.plugin_dispatchEvent___(this, event, ' +
+            var trustedHandler =
+                'return ___.plugin_dispatchEvent___(this, event, ' +
                 pluginId + ', ' + fnNameExpr + ');';
-            if (attribName === 'onsubmit') {
-              trustedHandler =
-                'try { ' + trustedHandler + ' } finally { return false; }';
-            } else {
-              trustedHandler = 'return ' + trustedHandler;
-            }
             return trustedHandler;
           case html4.atype.URI:
             value = String(value);
@@ -26537,7 +26646,7 @@ var Domado = (function() {
       getDomicileForWindow: windowToDomicile.get.bind(windowToDomicile)
     });
   }
-  
+
   /**
    * Invoke the possibly guest-supplied onerror handler due to an uncaught
    * exception. This wrapper exists to ensure consistent behavior among the
@@ -26592,7 +26701,7 @@ var Domado = (function() {
       }
     }
   });
-  
+
   return cajaVM.constFunc(Domado_);
 })();
 
@@ -28493,6 +28602,10 @@ function SESFrameGroup(cajaInt, config, tamingWin, feralWin,
       });
 
     // TODO(felix8a): args.flash
+
+    // Advise SES that now is a good time to (re)check what are all
+    // the global variable names.
+    ses.resampleGlobal();
 
     var promise;
     if (args.uncajoledContent !== undefined) {
