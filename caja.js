@@ -23,7 +23,7 @@
  */
 
 var caja = (function () {
-  var cajaBuildVersion = '6011';
+  var cajaBuildVersion = '6014';
   var defaultServer = 'https://caja.appspot.com/';
   var defaultFrameGroup;
   var readyQueue = [];
@@ -317,9 +317,6 @@ var caja = (function () {
    *
    *     log - Optional user-supplied alternative to the browser's native
    *         'console.log' function.
-   *
-   *     flashbridge - Optional, location of flashbridge.swf.  This needs
-   *         to be on the same domain as the host page.
    *
    * @param config an object literal containing configuration parameters.
    * @param frameGroupReady function to be called back with a reference to

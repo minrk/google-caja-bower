@@ -1,7 +1,7 @@
-{var cajaBuildVersion='6011',StringMap,exports,ses;typeof window!=='undefined'&&(window['cajaBuildVersion']=cajaBuildVersion),(function(){'use strict';var
-create,createNull,freeze;create=Object.create,freeze=Object.freeze;function constFunc(func){return func.prototype=null,freeze(func)}function
-assertString(x){if('string'!==typeof x)throw new TypeError(('Not a string: '+x));return x}typeof
-ses==='undefined'||!ses.ok()||ses.es5ProblemReports.FREEZING_BREAKS_PROTOTYPES.beforeFailure?(createNull=function(){return{}}):(createNull=function(){return Object.create(null)}),StringMap=function
+{var cajaBuildVersion='6014',StringMap,exports,ses;typeof window!=='undefined'&&(window['cajaBuildVersion']=cajaBuildVersion),(function(){'use strict';var
+create,createNull,freeze;create=Object.create,freeze=Object.freeze;if(!freeze)return;function
+constFunc(func){return func.prototype=null,freeze(func)}function assertString(x){if('string'!==typeof
+x)throw new TypeError(('Not a string: '+x));return x}typeof ses==='undefined'||!ses.ok()||ses.es5ProblemReports.FREEZING_BREAKS_PROTOTYPES.beforeFailure?(createNull=function(){return{}}):(createNull=function(){return Object.create(null)}),StringMap=function
 StringMap(){var objAsMap=createNull();return freeze({'get':constFunc(function(key){return objAsMap[assertString(key)+'$']}),'set':constFunc(function(key,value){objAsMap[assertString(key)+'$']=value}),'has':constFunc(function(key){return assertString(key)+'$'in
 objAsMap}),'delete':constFunc(function(key){return delete objAsMap[assertString(key)+'$']})})}})(),exports={};function
 require(name){return exports}function define(d,f){f(exports)}define.amd=true,(function(root,mod){if(typeof
@@ -281,15 +281,14 @@ comment;while(cursor<comments.length){comment=comments[cursor];if(comment.extend
 >node.range[1]){return VisitorOption.Skip}}}),cursor=0,traverse(tree,{'leave':function(node){var
 comment;while(cursor<comments.length){comment=comments[cursor];if(node.range[1]<comment.extendedRange[0]){break}if(node.range[1]===comment.extendedRange[0]){if(!node.trailingComments){node.trailingComments=[]}node.trailingComments.push(comment);comments.splice(cursor,1)}else{cursor+=1}}if(cursor===comments.length){return VisitorOption.Break}if(comments[cursor].extendedRange[0]
 >node.range[1]){return VisitorOption.Skip}}}),tree}exports.version='1.3.2',exports.Syntax=Syntax,exports.traverse=traverse,exports.replace=replace,exports.attachComments=attachComments,exports.VisitorKeys=VisitorKeys,exports.VisitorOption=VisitorOption,exports.Controller=Controller}),(function(global){'use strict';global.ses=global.ses||{},ses.rewriter_={},ses.rewriter_.tokTypes=exports.tokTypes,ses.rewriter_.traverse=exports.traverse,ses.rewriter_.parse=exports.parse,ses.rewriter_.generate=exports.generate})(this),(function(){var
-ESCAPED_KEYWORD_AMBIGUITY=true,nameIsReservedWord;function introducesVarScope(node){return node.type==='FunctionExpression'||node.type==='FunctionDeclaration'}function
+nameIsReservedWord;function introducesVarScope(node){return node.type==='FunctionExpression'||node.type==='FunctionDeclaration'}function
 isTypeOf(node){return node.type==='UnaryExpression'&&node.operator==='typeof'&&!node.synthetic}function
 isId(node){return node.type==='Identifier'}function isVariableDecl(node){return node.type==='VariableDeclaration'}function
 isFunctionDecl(node){return node.type==='FunctionDeclaration'}function isStaticKeyPropertyAccess(node){return node.type==='MemberExpression'&&(node.computed?node.property.type==='Literal':true)}function
 isStaticKeyPropertyUpdateExpr(node){return node.type==='UpdateExpression'&&isStaticKeyPropertyAccess(node.argument)}function
 isStaticKeyPropertyCompoundAssignmentExpr(node){return node.type==='AssignmentExpression'&&node.operator.length>1&&node.operator[node.operator.length-1]==='='&&isStaticKeyPropertyAccess(node.left)}function
 isFunctionCall(node){return node.type==='CallExpression'&&isId(node.callee)}nameIsReservedWord=(function(){var
-tokTypes=ses.rewriter_.tokTypes,table=new StringMap,k;for(k in tokTypes)'keyword'in
-tokTypes[k]&&table.set(tokTypes[k].keyword,0);return table.has.bind(table)})();function
+tokTypes=ses.rewriter_.tokTypes,table=new Set,k;for(k in tokTypes)'keyword'in tokTypes[k]&&table.add(tokTypes[k].keyword,0);return table.has.bind(table)})();function
 isIdentifierNameContext(node){var type=node.type;return type==='MemberExpression'||!!(node.kind&&node.key)}function
 rewriteFuncDecl(scope,node,parentNode){var exprNode={'type':'ExpressionStatement','expression':{'type':'AssignmentExpression','operator':'=','left':globalVarAst(node.id),'right':node.id}},body=parentNode.body,currentIdx=body.indexOf(node),nextIdx=currentIdx+1;body.splice(nextIdx,0,exprNode)}function
 rewriteVars(scope,node,parentNode){var assignments;if(parentNode.type==='ForInStatement')return;assignments=[],node.declarations.forEach(function(decl){assignments.push({'type':'AssignmentExpression','operator':'=','left':globalVarAst(decl.id),'right':globalVarAst(decl.id)}),decl.init&&assignments.push({'type':'AssignmentExpression','operator':'=','left':globalVarAst(decl.id),'right':decl.init})}),parentNode.type==='ForStatement'?(node.type='SequenceExpression',node.expressions=assignments):(node.type='ExpressionStatement',node.expression={'type':'SequenceExpression','expressions':assignments})}function
@@ -297,16 +296,16 @@ globalVarAst(varName){return{'type':'MemberExpression','object':{'type':'ThisExp
 rewriteTypeOf(scope,node){var arg=node.argument;node.type='CallExpression',node.arguments=[],node.callee={'type':'FunctionExpression','id':null,'params':[],'body':{'type':'BlockStatement','body':[{'type':'TryStatement','block':{'type':'BlockStatement','body':[{'type':'ReturnStatement','argument':{'synthetic':true,'type':'UnaryExpression','operator':'typeof','prefix':true,'argument':arg}}]},'handlers':[{'type':'CatchClause','param':{'type':'Identifier','name':'e'},'guard':null,'body':{'type':'BlockStatement','body':[{'type':'ReturnStatement','argument':{'type':'Literal','value':'undefined','raw':'\'undefined\''}}]}}],'finalizer':null}]}}}function
 rewriteFunctionCall(scope,node){node.callee=makeTrivialSequenceExpression(node.callee)}function
 makeTrivialSequenceExpression(rhs){return{'type':'SequenceExpression','expressions':[{'type':'Literal','value':1},rhs]}}function
-rewriteStaticKeyMemberExpression(scope,node){rewrite(scope,node.object);switch(node.property.type){case'Identifier':node.property=makeTrivialSequenceExpression({'type':'Literal','value':node.property.name});break;case'Literal':node.property=makeTrivialSequenceExpression(node.property);break;default:throw new
-Error('Programming error')}node.computed=true}function needsRewriting(options){return options.rewriteTopLevelVars||options.rewriteTopLevelFuncs||options.rewriteFunctionCalls||options.rewriteTypeOf||options.rewritePropertyUpdateExpr||options.rewritePropertyCompoundAssignmentExpr}function
-rewrite(scope,node){return ses.rewriter_.traverse(node,{'enter':function enter(node,parentNode){if(ESCAPED_KEYWORD_AMBIGUITY&&isId(node)){if(nameIsReservedWord(node.name)&&!isIdentifierNameContext(parentNode)){throw new
+rewrite(scope,node){return ses.rewriter_.traverse(node,{'enter':function enter(node,parentNode){if(isId(node)){if(nameIsReservedWord(node.name)&&!isIdentifierNameContext(parentNode)){throw new
 SyntaxError(('Programs containing Unicode escapes in reserved words '+'will be misparsed on some platforms and are not currently '+'permitted by SES.'))}}if(scope.options.rewriteTopLevelFuncs&&isFunctionDecl(node)&&scope.scopeLevel===0){rewriteFuncDecl(scope,node,parentNode);scope.dirty=true}else
 if(scope.options.rewriteTypeOf&&isTypeOf(node)&&isId(node.argument)){rewriteTypeOf(scope,node);scope.dirty=true}else
 if(scope.options.rewriteTopLevelVars&&isVariableDecl(node)&&scope.scopeLevel===0){rewriteVars(scope,node,parentNode);scope.dirty=true}else
-if(scope.options.rewriteFunctionCalls&&isFunctionCall(node)){rewriteFunctionCall(scope,node);scope.dirty=true}else
-if(scope.options.rewritePropertyUpdateExpr&&isStaticKeyPropertyUpdateExpr(node)){rewriteStaticKeyMemberExpression(scope,node.argument);scope.dirty=true}else
-if(scope.options.rewritePropertyCompoundAssignmentExpr&&isStaticKeyPropertyCompoundAssignmentExpr(node)){rewriteStaticKeyMemberExpression(scope,node.left);rewrite(scope,node.right);scope.dirty=true}if(introducesVarScope(node)){scope.scopeLevel++}},'leave':function
+if(scope.options.rewriteFunctionCalls&&isFunctionCall(node)){rewriteFunctionCall(scope,node);scope.dirty=true}if(introducesVarScope(node)){scope.scopeLevel++}},'leave':function
 leave(node){if(introducesVarScope(node)){scope.scopeLevel--}}}),node}function rewriteProgram(options,ast){var
-scope;if(ESCAPED_KEYWORD_AMBIGUITY||needsRewriting(options)){scope={'options':options,'dirty':false,'scopeLevel':0},rewrite(scope,ast);if(scope.scopeLevel!==0)throw new
-Error('Internal error traversing the AST');return scope.dirty}return false}ses.mitigateSrcGotchas=function(funcBodySrc,options,logger){var
-ast,dirty,message,quotedMessage;if(!needsRewriting(options)&&!options.parseFunctionBody)return funcBodySrc;try{return ast=ses.rewriter_.parse(funcBodySrc),dirty=rewriteProgram(options,ast),dirty||options.forceParseAndRender?'\n/*\n * Program rewritten to mitigate differences between\n * Caja and strict-mode JavaScript.\n * For more see  * https://code.google.com/p/google-caja/wiki/SES#Source-SES_vs_Target-SES\n */\n'+ses.rewriter_.generate(ast):funcBodySrc}catch(e){return message=''+e,logger.warn('Failed to parse program: '+message),quotedMessage=JSON.stringify(message),'(function() { throw new SyntaxError(\"Failed to parse program: \" + '+quotedMessage+'); })()'}}})(),cajaIframeDone___()}
+scope={'options':options,'dirty':false,'scopeLevel':0};rewrite(scope,ast);if(scope.scopeLevel!==0)throw new
+Error('Internal error traversing the AST');return scope.dirty}ses.mitigateSrcGotchas=function(asExpr,src,options,logger){var
+ast,message;src=asExpr?'('+src+'\n);':'(function() { '+src+'\n});\n';try{ast=ses.rewriter_.parse(src,{'forbidReserved':false});if(ast.type!=='Program')throw new
+SyntaxError(('Internal malformed parse: '+src));if(ast.body.length!==1)throw new
+SyntaxError(('Expected an expression: '+src));if(ast.body[0].type!=='ExpressionStatement')throw new
+SyntaxError(('Expected expression: '+src));ast=ast.body[0].expression;if(!asExpr){if(ast.type!=='FunctionExpression')throw new
+SyntaxError(('Internal: expected function: '+src));ast=ast.body,ast.type==='BlockStatement'&&(ast.type='Program')}return rewriteProgram(options,ast),ses.rewriter_.generate(ast)}catch(e){throw message=''+e,logger.warn('Failed to parse program: '+message),e}}})(),cajaIframeDone___()}
